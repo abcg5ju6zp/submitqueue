@@ -1,6 +1,6 @@
 import { create, toJson } from "@bufbuild/protobuf";
 import { ProjectValidationSchema } from "@submitqueue/api/stovepipe";
-import { resolveHost } from "../../../../../../server/host";
+import { onLog, resolveHost } from "../../../../../../server/host";
 import {
   authenticationChallenge,
   isAuthorized,
@@ -18,6 +18,7 @@ export async function GET(request: Request): Promise<Response> {
     path: url.pathname,
     search: url.searchParams,
     signal: request.signal,
+    onLog,
   });
   const headers = { "Cache-Control": "private, no-store" };
   if (result.kind === "project-json") {
