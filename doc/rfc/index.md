@@ -24,6 +24,7 @@ Design documents and technical proposals, grouped by scope. Shared/cross-cutting
 - [Gateway Status and List APIs](submitqueue/status-list-api.md) - Gateway-owned request context, materialized current status, sqid or change-URI status lookup, and queue admission listing
 - [Speculation](submitqueue/speculation.md) - Why SubmitQueue speculates, the path/tree model, and the two pluggable seams: speculation-tree enumeration and path selection
 - [Outcome Scorer](submitqueue/outcome-scorer.md) - How likely a batch is to reach Succeeded: `Score(ctx, batch, paths)` as a logit-linear model — a base content price plus YAML weights on path and batch evidence (`pathPassed`, `pathFailed`, `landing`, `cancelling`)
+- [Tango Conflict Analyzer](submitqueue/tango-conflict-analyzer.md) - A `conflict.Analyzer` backed by Tango: each batch's changed targets stored as a signature of 64-bit IDs in a durable store with an in-memory cache, and batches conflict when their signatures share an ID
 - [Best-First Speculation Path Generation](submitqueue/speculation-generator-best-first.md) - The default Generator: per-head lazy streams of flip subsets merged best-first across heads, log-probability ranking, and the strict snapshot contract
 - [Modular Queue Wiring](submitqueue/modular-queue-wiring.md) - `pipeline.Construct` for the SubmitQueue orchestrator (`Deps` + `Stages` in `submitqueue/orchestrator/pipeline.go`, host in `service/submitqueue/orchestrator/server`). Stovepipe, and the gateway and Runway servers, remain hand-wired
 
