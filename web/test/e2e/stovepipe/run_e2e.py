@@ -64,12 +64,12 @@ def main():
         )
         env["STOVEPIPE_WEB_QUEUES"] = json.dumps(
             [
-                {"name": "monorepo/main", "projects": ["example"]},
+                {"name": "monorepo/main", "projects": []},
                 {
                     "name": "web/pagination",
                     "projects": [f"project-{i}" for i in range(1, 52)],
                 },
-                {"name": "web/empty", "projects": ["example"]},
+                {"name": "web/empty", "projects": []},
             ]
         )
         compose = [

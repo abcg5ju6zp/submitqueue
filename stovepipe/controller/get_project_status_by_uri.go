@@ -172,9 +172,6 @@ func validateProjectStatusRequest(req entity.GetProjectStatusByURIRequest) error
 	if err := validateHistoryIdentifier("change URI", req.ChangeURI); err != nil {
 		return fmt.Errorf("GetProjectStatusByURI invalid change_uri=%q: %w", req.ChangeURI, err)
 	}
-	if len(req.Projects) == 0 {
-		return fmt.Errorf("GetProjectStatusByURI projects must be non-empty: %w", ErrInvalidRequest)
-	}
 	seen := make(map[string]struct{}, len(req.Projects))
 	for _, project := range req.Projects {
 		if err := validateHistoryIdentifier("project", project); err != nil {

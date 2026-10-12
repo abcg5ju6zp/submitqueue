@@ -56,6 +56,10 @@ test("real ingestion, queue selection, cursors, project results, history and ref
     await expect(
       page.getByText("No project results recorded on this page."),
     ).toBeVisible();
+    const rawHref = await rawProjects.getAttribute("href");
+    const response = await page.request.get(rawHref!);
+    expect(response.ok()).toBe(true);
+    expect(await response.json()).toEqual([]);
     await refresh.click();
     await expect(refresh).toBeEnabled();
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);

@@ -195,6 +195,43 @@ describe("Stovepipe page loading", () => {
     });
     expect(() => JSON.stringify(result)).not.toThrow();
   });
+  it("loads status and history without project selectors", async () => {
+    const { app, service, paths } = createPageTestContext([]);
+    vi.mocked(service.getProjectStatusByURI).mockResolvedValue({
+      ...status,
+      projects: [],
+    });
+
+    const result = await app.handle({
+      path: paths.change("repo/main", changeUri),
+      search: new URLSearchParams(),
+    });
+
+    expect(service.getProjectStatusByURI).toHaveBeenCalledWith(
+      { queue: "repo/main", changeUri, projects: [], pageSize: 10, pageToken: "" },
+      {},
+    );
+    expect(result).toMatchObject({
+      kind: "render",
+      model: {
+        requestId: "7",
+        status: {
+          ok: true,
+          data: { repositoryDegree: 0, projects: [], nextHref: null },
+        },
+        history: { ok: true },
+      },
+    });
+    expect(service.getRequestHistoryByID).toHaveBeenCalledWith(
+      { queue: "repo/main", requestId: "7" },
+      {},
+    );
+
+    expect(await app.handle({
+      path: paths.projectJSON("repo/main", changeUri),
+      search: new URLSearchParams(),
+    })).toEqual({ kind: "project-json", data: [] });
+  });
   it("requests ten configured projects per page without adding unreturned projects", async () => {
     const projects = Array.from(
       { length: 11 },

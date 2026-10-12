@@ -1,7 +1,7 @@
 export interface Queue {
   /** Queue name, preserved verbatim in the UI. */
   name: string;
-  /** Nonempty consumer-selected project IDs. */
+  /** Consumer-selected project IDs; empty requests only request and repository status. */
   projects: readonly string[];
 }
 export type ReadResult<T> =

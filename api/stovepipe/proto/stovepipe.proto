@@ -112,7 +112,7 @@ message GetProjectStatusByURIRequest {
     string queue = 1;
     // Exact VCS-agnostic URI of the commit under validation.
     string change_uri = 2;
-    // Required consumer-defined project IDs whose recorded results are requested.
+    // Consumer-defined project IDs whose recorded results are requested. Empty returns request and repository status only.
     repeated string projects = 3;
     // Maximum requested projects to return in one page. Zero selects the server default.
     int32 page_size = 4;

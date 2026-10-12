@@ -13,7 +13,7 @@ For a separate backend or development server, configure the environment below an
 | `STOVEPIPE_URL` | Backend origin; the local overlay sets `http://stovepipe-service:8080`. |
 | `STOVEPIPE_ALLOW_PLAINTEXT` | Set `true` for local HTTP/2 without TLS. |
 | `STOVEPIPE_WEB_TOKEN` | Required Basic authentication password; the local overlay defaults to `test`. |
-| `STOVEPIPE_WEB_QUEUES` | JSON array of queue objects with `name` and nonempty `projects` arrays. Names must match the backend; project IDs must be unique within each queue. The local overlay supplies the demo queues. |
+| `STOVEPIPE_WEB_QUEUES` | JSON array of queue objects with `name` and `projects` arrays. Use an empty array to load request status, repository results, and history without project results. Names must match the backend; project IDs must be unique within each queue. The local overlay supplies the demo queues with empty project arrays. |
 | `LOG_LEVEL` | JSON logging level; defaults to `info`. |
 
 A queue such as `monorepo/main` appears at `/monorepo%2Fmain`; its change page appears at `/monorepo%2Fmain/change/<percent-escaped-uri>`.

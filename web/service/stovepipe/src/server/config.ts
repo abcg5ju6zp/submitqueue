@@ -19,12 +19,11 @@ export function loadConfiguration(
       typeof queue.name !== "string" ||
       !queue.name ||
       !Array.isArray(queue.projects) ||
-      queue.projects.length === 0 ||
       queue.projects.some(
         (project: unknown) => typeof project !== "string" || !project,
       )
     )
-      throw new Error("Each queue needs a name and at least one project ID");
+      throw new Error("Each queue needs a name and an array of project IDs");
     if (
       queues.some((item) => item.name === queue.name) ||
       new Set(queue.projects).size !== queue.projects.length

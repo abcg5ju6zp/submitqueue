@@ -9,7 +9,7 @@ services:
       STOVEPIPE_URL: http://stovepipe-service:8080
       STOVEPIPE_ALLOW_PLAINTEXT: "true"
       STOVEPIPE_WEB_TOKEN: ${STOVEPIPE_WEB_TOKEN:-test}
-      STOVEPIPE_WEB_QUEUES: ${STOVEPIPE_WEB_QUEUES:-[{"name":"monorepo/main","projects":["example"]},{"name":"monorepo/release","projects":["example"]},{"name":"monorepo/slow","projects":["example"]}]}
+      STOVEPIPE_WEB_QUEUES: ${STOVEPIPE_WEB_QUEUES:-[{"name":"monorepo/main","projects":[]},{"name":"monorepo/release","projects":[]},{"name":"monorepo/slow","projects":[]}]}
     depends_on:
       stovepipe-service:
         condition: service_started

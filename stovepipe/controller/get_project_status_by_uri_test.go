@@ -58,7 +58,9 @@ func TestGetProjectStatusByURI(t *testing.T) {
 		{name: "missing uri", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, Projects: []string{"project-a"}}, uriErr: storage.ErrNotFound, wantNotFound: true},
 		{name: "request summary visibility gap", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, Projects: []string{"project-a"}}, summaryErr: storage.ErrNotFound, wantRetryable: true},
 		{name: "empty queue", request: entity.GetProjectStatusByURIRequest{ChangeURI: projectStatusURI}, wantInvalid: true},
-		{name: "empty projects", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI}, wantInvalid: true},
+		{name: "no projects without repository fact", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI}, factErr: storage.ErrNotFound},
+		{name: "empty projects with repository fact", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, Projects: []string{}}, fact: entity.ValidationFact{URI: projectStatusURI, RequestID: projectStatusID, Degree: entity.DegreeGreen}, wantFact: true},
+		{name: "project page token without projects", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, PageToken: "token"}, factErr: storage.ErrNotFound, wantInvalid: true, noProjectLookup: true},
 		{name: "empty project", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, Projects: []string{""}}, wantInvalid: true},
 		{name: "duplicate projects", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, Projects: []string{"project-a", "project-a"}}, wantInvalid: true},
 		{name: "invalid page size", request: entity.GetProjectStatusByURIRequest{Queue: projectStatusQueue, ChangeURI: projectStatusURI, PageSize: maxProjectStatusPageSize + 1}, wantInvalid: true},
@@ -110,6 +112,8 @@ func TestGetProjectStatusByURI(t *testing.T) {
 			assert.Equal(t, requestSummary, got.RequestSummary)
 			assert.Equal(t, tt.wantFact, got.HasRepositoryValidationFact)
 			assert.False(t, got.ProjectResultsComplete)
+			assert.Empty(t, got.ProjectValidationFacts)
+			assert.Empty(t, got.NextPageToken)
 			if tt.wantFact {
 				assert.Equal(t, tt.fact, got.RepositoryValidationFact)
 			}

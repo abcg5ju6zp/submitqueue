@@ -12,7 +12,7 @@ Use the server entry's `createStovepipeWeb` to load a page and render its model 
 
 Change pages use `/<queue>/change/<percent-escaped-uri>` and look up status with `GetProjectStatusByURI`. History uses the request ID returned by that lookup. The `/request/` path is reserved for a future ID-based view. Queue pagination uses the backend's opaque continuations, and the latest URL carries no time window.
 
-Project results request ten configured project IDs per page beside the request status, with history below. Only entries returned by the backend are displayed; a page can have fewer than ten results or be empty. The raw JSON link collects the returned project entries across all backend pages, independent of display pagination. The reference host serializes only the projects array as protobuf JSON. Configured projects are not an inventory of every project in a repository.
+Project results request ten configured project IDs per page beside the request status, with history below. With an empty project list, `GetProjectStatusByURI` still returns request and repository status, and history loads using the returned request ID. Only entries returned by the backend are displayed; a page can have fewer than ten results or be empty. The raw JSON link collects the returned project entries across all backend pages, independent of display pagination. The reference host serializes only the projects array as protobuf JSON. Configured projects are not an inventory of every project in a repository.
 
 ## Refresh and presentation
 

@@ -8,7 +8,7 @@ describe("Stovepipe host configuration", () => {
   it("preserves queue and project identities", () => {
     const queues = [
       { name: "repo/main", projects: ["project/a"] },
-      { name: "repo/empty", projects: ["project/b"] },
+      { name: "repo/empty", projects: [] },
     ];
     expect(
       loadConfiguration({
@@ -20,7 +20,8 @@ describe("Stovepipe host configuration", () => {
   it("rejects missing or ambiguous queue/project configuration", () => {
     for (const queues of [
       [],
-      [{ name: "q", projects: [] }],
+      [{ name: "q" }],
+      [{ name: "q", projects: [""] }],
       [{ name: "q", projects: ["a", "a"] }],
       [
         { name: "q", projects: ["a"] },

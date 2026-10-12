@@ -338,7 +338,7 @@ export type GetProjectStatusByURIRequest = Message<"uber.submitqueue.stovepipe.G
   changeUri: string;
 
   /**
-   * Required consumer-defined project IDs whose recorded results are requested.
+   * Consumer-defined project IDs whose recorded results are requested. Empty returns request and repository status only.
    *
    * @generated from field: repeated string projects = 3;
    */

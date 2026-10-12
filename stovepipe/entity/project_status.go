@@ -20,7 +20,7 @@ type GetProjectStatusByURIRequest struct {
 	Queue string
 	// ChangeURI identifies the exact commit under validation.
 	ChangeURI string
-	// Projects limits results to the supplied consumer-defined project IDs.
+	// Projects limits results to the supplied consumer-defined project IDs; empty returns request and repository status only.
 	Projects []string
 	// PageSize is the requested maximum number of requested projects to inspect.
 	PageSize int32

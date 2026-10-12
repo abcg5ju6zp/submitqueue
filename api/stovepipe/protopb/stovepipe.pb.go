@@ -627,7 +627,7 @@ type GetProjectStatusByURIRequest struct {
 	Queue string `protobuf:"bytes,1,opt,name=queue,proto3" json:"queue,omitempty"`
 	// Exact VCS-agnostic URI of the commit under validation.
 	ChangeUri string `protobuf:"bytes,2,opt,name=change_uri,json=changeUri,proto3" json:"change_uri,omitempty"`
-	// Required consumer-defined project IDs whose recorded results are requested.
+	// Consumer-defined project IDs whose recorded results are requested. Empty returns request and repository status only.
 	Projects []string `protobuf:"bytes,3,rep,name=projects,proto3" json:"projects,omitempty"`
 	// Maximum requested projects to return in one page. Zero selects the server default.
 	PageSize int32 `protobuf:"varint,4,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
