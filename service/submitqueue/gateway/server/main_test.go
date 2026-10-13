@@ -106,6 +106,11 @@ func TestGatewayStatusError(t *testing.T) {
 			code: codes.InvalidArgument,
 		},
 		{
+			name: "queue paused",
+			err:  &controller.QueuePausedError{Queue: "paused"},
+			code: codes.FailedPrecondition,
+		},
+		{
 			name: "request not found",
 			err:  &controller.RequestNotFoundError{Sqid: "1"},
 			code: codes.NotFound,

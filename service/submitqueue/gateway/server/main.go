@@ -44,6 +44,9 @@ import (
 	"github.com/uber/submitqueue/service/submitqueue/gateway/server/mapper"
 	"github.com/uber/submitqueue/submitqueue/core/topickey"
 	yamlqueueconfig "github.com/uber/submitqueue/submitqueue/extension/queueconfig/yaml"
+	"github.com/uber/submitqueue/submitqueue/extension/queuepause"
+	queuepausefile "github.com/uber/submitqueue/submitqueue/extension/queuepause/file"
+	queuepausenoop "github.com/uber/submitqueue/submitqueue/extension/queuepause/noop"
 	"github.com/uber/submitqueue/submitqueue/gateway/controller"
 	logctrl "github.com/uber/submitqueue/submitqueue/gateway/controller/log"
 	requestcore "github.com/uber/submitqueue/submitqueue/gateway/core/request"
@@ -159,9 +162,27 @@ func gatewayStatusError(err error) error {
 		return status.Error(codes.Internal, err.Error())
 	case controller.IsInvalidRequest(err), controller.IsUnrecognizedQueue(err):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case controller.IsQueuePaused(err):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	default:
 		return err
 	}
+}
+
+// newQueuePauseStore enables the file-backed pause store only when
+// QUEUE_PAUSE_CONFIG_PATH is set; otherwise no queue is ever paused.
+func newQueuePauseStore(logger *zap.Logger) (queuepause.Store, error) {
+	path := os.Getenv("QUEUE_PAUSE_CONFIG_PATH")
+	if path == "" {
+		logger.Info("queue pause disabled")
+		return queuepausenoop.New(), nil
+	}
+	store, err := queuepausefile.NewStore(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load queue pause config: %w", err)
+	}
+	logger.Info("queue pause configured", zap.String("path", path))
+	return store, nil
 }
 
 func main() {
@@ -264,6 +285,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to load queue configs: %w", err)
 	}
+	queuePauses, err := newQueuePauseStore(logger)
+	if err != nil {
+		return err
+	}
 	configuredQueues, err := queueConfigs.List(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list queue configs: %w", err)
@@ -359,7 +384,7 @@ func run() error {
 	storageFty := storageFactory{backend: store}
 	materializer := requestcore.NewMaterializer(storageFty)
 	pingController := controller.NewPingController(logger, scope)
-	landController := controller.NewLandController(logger.Sugar(), scope, cnt, storageFty, materializer, queueConfigs, registry)
+	landController := controller.NewLandController(logger.Sugar(), scope, cnt, storageFty, materializer, queueConfigs, queuePauses, registry)
 	cancelController := controller.NewCancelController(logger.Sugar(), scope, storageFty, materializer, registry)
 	requestSummaryController := controller.NewRequestSummaryController(logger.Sugar(), scope, storageFty)
 	listController := controller.NewListController(logger.Sugar(), scope, storageFty, queueConfigs)
