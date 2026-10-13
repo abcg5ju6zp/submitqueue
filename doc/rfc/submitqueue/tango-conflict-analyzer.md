@@ -93,8 +93,8 @@ class node_relax toneNeutral
 | | Signature store | Target dictionary | In-memory cache |
 | --- | --- | --- | --- |
 | **Entity** | `TargetSignature` | `TargetLabel` | same `TargetSignature` |
-| **Holds** | Per batch: sorted `(ID, distance)` entries, base revision | Per ID: its label (more than one only on a hash collision) | Signatures this process has seen |
-| **Key** | `(queue, batch ID)` | `(queue, ID, label)` | `(queue, batch ID)` |
+| **Holds** | Per batch: sorted `(ID, distance)` entries, base revision | Per ID: its label | Signatures this process has seen |
+| **Key** | `(queue, batch ID)` | `(queue, ID)` | `(queue, batch ID)` |
 | **Durable** | Yes | Yes | No |
 | **Written** | Once per batch, create-if-absent, before the batch is promoted to `Created` | When a Tango response is decoded; asynchronous, best-effort, idempotent | On a miss, after the store or Tango answers |
 | **Read by** | The analyzer; relaxation | Debugging and conflict explanations; never the conflict check | The analyzer |
@@ -134,7 +134,7 @@ type SignatureTarget struct {
 
 // TargetLabel is one label and the ID it hashes to.
 type TargetLabel struct {
-    // Queue is the queue the label was seen in. Unique together with ID and Label.
+    // Queue is the queue the label was seen in. Unique together with ID.
     Queue string
     // ID is the 64-bit hash of Label.
     ID uint64
@@ -145,7 +145,8 @@ type TargetLabel struct {
 }
 ```
 
-- **Create and read.** Both stores' `Create` returns `ErrAlreadyExists` if the record exists, so the first record written stays and repeating a write is harmless. The signature store reads by batch ID, and the dictionary reads by ID through a bounded prefix scan on `(queue, ID)`.
+- **Create and read.** Both stores' `Create` returns `ErrAlreadyExists` if the record exists, so the first record written stays and repeating a write is harmless. Each store reads by its key alone: batch ID for signatures, target ID for the dictionary.
+- **Hash collisions.** Two labels can share an ID, so the dictionary may hold a label other than the one a signature entry came from. The first label written stays. When a write finds a different label already stored, the writer counts and logs a collision, so it never happens silently. The conflict check never reads the dictionary, and a collision only adds a false conflict, so the effect is limited to a wrong label in a debugging view.
 - **Signature encoding.** The targets are stored as one binary value: per target, an 8-byte big-endian ID and a varint distance. At about 9 bytes per target, a typical batch of a few thousand targets is tens of KB, and the largest requests, with millions of targets, are tens of MB. The first MySQL schema uses a `LONGBLOB` column, so no request fails on a column limit.
 
 ## Tango request and response
@@ -358,7 +359,6 @@ For each `CHANGED` target the rule keeps the dependencies in the new list but no
 ## Open questions
 
 - **Base SHA source.** Nothing in the orchestrator resolves the target branch tip. Candidates are a resolver that reads the tip from the remote, or the PR's own base. The queue config also needs the repo and branch, and the Tango `remote` format (`org/repo` per the proto, a clone URL per the README) is unconfirmed.
-- **Label key.** A label longer than the MySQL primary-key limit needs a fixed-width digest in the dictionary key; the length distribution of real labels has not been checked.
 - **Non-GitHub change schemes.** Tango parses only `github://` PR URIs, so each other scheme needs Tango support or a conversion step on our side. Until then, queues on those schemes (such as `phab://`) keep `pathoverlap` or `all`.
 - **Oversized signatures.** `LONGBLOB` avoids MySQL column limits, but a backend with an item limit would need either chunking or a size cap that treats such a batch as conflicting with everything. Deferred until rollout data shows how many real batches are that large.
 - **Recording added edges and targets.** Whether each signature records, at admission, that its batch added a dependency edge or a target. Inheritance needs it, so the Collect step of [Response to signature](#tango-request-and-response), which keeps only IDs and distances today, would have to read the dependency lists. Without it, inheritance can only apply to batches admitted after it ships.
