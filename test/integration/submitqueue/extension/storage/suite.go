@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	orchstorage "github.com/uber/submitqueue/submitqueue/orchestrator/extension/storage"
@@ -483,6 +484,74 @@ func (s *StorageContractSuite) TestStorage_TargetSignatureStore() {
 		require.NoError(t, err)
 		assert.False(t, found)
 		require.Error(t, storeB.Create(ctx, entity.TargetSignature{Queue: "sig-queue-a", BatchID: "mismatch"}), "a mismatched-queue write must be rejected")
+	})
+}
+
+func (s *StorageContractSuite) TestStorage_TargetDictionaryStore() {
+	t := s.T()
+	ctx := s.ctx
+	storeA := s.forQueue("dict-queue-a").GetTargetDictionaryStore()
+	storeB := s.forQueue("dict-queue-b").GetTargetDictionaryStore()
+
+	// An ID with the high bit set must survive the unsigned column round trip.
+	const highID = uint64(1) << 63
+	label := func(id uint64, name string) entity.TargetLabel {
+		return entity.TargetLabel{Queue: "dict-queue-a", ID: id, Label: name, CreatedAt: 1700000000000}
+	}
+
+	t.Run("round trip", func(t *testing.T) {
+		require.NoError(t, storeA.Create(ctx, label(7, "//app/server:lib")))
+
+		got, found, err := storeA.Get(ctx, 7)
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, label(7, "//app/server:lib"), got)
+	})
+
+	t.Run("ID with the high bit set", func(t *testing.T) {
+		require.NoError(t, storeA.Create(ctx, label(highID, "//high:bit")))
+
+		got, found, err := storeA.Get(ctx, highID)
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, label(highID, "//high:bit"), got)
+	})
+
+	t.Run("long label", func(t *testing.T) {
+		long := "//" + strings.Repeat("p", 900) + ":target"
+		require.NoError(t, storeA.Create(ctx, label(11, long)))
+
+		got, found, err := storeA.Get(ctx, 11)
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, label(11, long), got)
+	})
+
+	t.Run("a second label for a recorded ID is rejected and the first stays", func(t *testing.T) {
+		require.NoError(t, storeA.Create(ctx, label(9, "//a:x")))
+		require.ErrorIs(t, storeA.Create(ctx, label(9, "//b:y")), storage.ErrAlreadyExists)
+
+		got, found, err := storeA.Get(ctx, 9)
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, label(9, "//a:x"), got)
+	})
+
+	t.Run("repeated create returns ErrAlreadyExists", func(t *testing.T) {
+		require.ErrorIs(t, storeA.Create(ctx, label(7, "//app/server:lib")), storage.ErrAlreadyExists)
+	})
+
+	t.Run("unknown ID is not found", func(t *testing.T) {
+		_, found, err := storeA.Get(ctx, 12345)
+		require.NoError(t, err)
+		assert.False(t, found)
+	})
+
+	t.Run("invisible through another queue", func(t *testing.T) {
+		_, found, err := storeB.Get(ctx, 7)
+		require.NoError(t, err)
+		assert.False(t, found)
+		require.Error(t, storeB.Create(ctx, label(7, "//app/server:lib")), "a mismatched-queue write must be rejected")
 	})
 }
 

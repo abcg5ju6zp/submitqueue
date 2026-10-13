@@ -47,6 +47,7 @@ func TestNewStorage(t *testing.T) {
 	assert.NotNil(t, bound.GetBuildStore())
 	assert.NotNil(t, bound.GetSpeculationPathSetStore())
 	assert.NotNil(t, bound.GetTargetSignatureStore())
+	assert.NotNil(t, bound.GetTargetDictionaryStore())
 
 	_, err = s.For("")
 	assert.Error(t, err, "resolving an empty queue name must fail")

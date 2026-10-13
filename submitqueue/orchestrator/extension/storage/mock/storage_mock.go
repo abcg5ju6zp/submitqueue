@@ -206,6 +206,20 @@ func (mr *MockStorageMockRecorder) GetSpeculationPathSetStore() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSpeculationPathSetStore", reflect.TypeOf((*MockStorage)(nil).GetSpeculationPathSetStore))
 }
 
+// GetTargetDictionaryStore mocks base method.
+func (m *MockStorage) GetTargetDictionaryStore() storage.TargetDictionaryStore {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetTargetDictionaryStore")
+	ret0, _ := ret[0].(storage.TargetDictionaryStore)
+	return ret0
+}
+
+// GetTargetDictionaryStore indicates an expected call of GetTargetDictionaryStore.
+func (mr *MockStorageMockRecorder) GetTargetDictionaryStore() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTargetDictionaryStore", reflect.TypeOf((*MockStorage)(nil).GetTargetDictionaryStore))
+}
+
 // GetTargetSignatureStore mocks base method.
 func (m *MockStorage) GetTargetSignatureStore() storage.TargetSignatureStore {
 	m.ctrl.T.Helper()

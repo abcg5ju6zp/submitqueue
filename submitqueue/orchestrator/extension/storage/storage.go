@@ -73,4 +73,7 @@ type Storage interface {
 
 	// GetTargetSignatureStore returns the TargetSignatureStore instance.
 	GetTargetSignatureStore() basestorage.TargetSignatureStore
+
+	// GetTargetDictionaryStore returns the TargetDictionaryStore instance.
+	GetTargetDictionaryStore() basestorage.TargetDictionaryStore
 }
