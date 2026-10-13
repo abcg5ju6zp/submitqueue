@@ -17,7 +17,8 @@ node_stage["Dependency analysis"]
 
 subgraph group_analyzer["conflict/tango analyzer"]
   node_analyze["Analyzer"]
-  node_lookup["Get signature<br/>one per batch"]
+  node_sign["Sign new batch<br/>only caller of Tango"]
+  node_lookup["Read signatures<br/>in-flight batches"]
   node_request["Build Tango request<br/>URIs, base, remote"]
   node_convert["Convert response<br/>labels to IDs"]
   node_compare["Compare signatures<br/>intersect ID sets"]
@@ -38,18 +39,21 @@ end
 node_relax["Conflict relaxation<br/>later feature"]
 
 node_stage -->|"1. batch, in-flight batches"| node_analyze
-node_analyze -->|"2. get each signature"| node_lookup
-node_lookup -->|"3a. look up"| node_cache
-node_lookup -->|"3b. on cache miss, fills cache on hit"| node_sigstore
-node_lookup -->|"3c. on store miss"| node_request
+node_analyze -->|"2. sign the new batch"| node_sign
+node_sign -->|"3a. look up"| node_cache
+node_sign -->|"3b. on cache miss, fills cache on hit"| node_sigstore
+node_sign -->|"3c. on store miss"| node_request
 node_changes -->|"3d. change URIs"| node_request
 node_base -->|"3e. base revision"| node_request
 node_request -->|"3f. request"| node_tango
 node_tango -->|"3g. changed targets + metadata"| node_convert
 node_convert -->|"3h. create, existing record kept, fills cache"| node_sigstore
 node_convert -->|"3i. labels, async"| node_dict
-node_analyze -->|"4. then compare"| node_compare
-node_analyze -->|"5. conflicts"| node_stage
+node_analyze -->|"4. read each in-flight signature"| node_lookup
+node_lookup -->|"5a. look up"| node_cache
+node_lookup -->|"5b. on cache miss, fills cache on hit; a miss fails the analysis"| node_sigstore
+node_analyze -->|"6. then compare"| node_compare
+node_analyze -->|"7. conflicts"| node_stage
 node_sigstore -.->|"later: reads"| node_relax
 
 classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
@@ -59,7 +63,7 @@ classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
 classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
 
 class node_stage toneAmber
-class node_analyze,node_lookup,node_request,node_convert,node_compare toneBlue
+class node_analyze,node_sign,node_lookup,node_request,node_convert,node_compare toneBlue
 class node_cache,node_sigstore,node_dict toneRose
 class node_changes,node_base,node_tango toneMint
 class node_relax toneNeutral
@@ -68,18 +72,21 @@ class node_relax toneNeutral
 | Step | What it is |
 | --- | --- |
 | 1 | Dependency analysis passes the batch and the in-flight batches to the analyzer |
-| 2 | The analyzer gets a signature for each batch |
-| 3a | Look in the in-memory cache |
+| 2 | The analyzer signs the new batch |
+| 3a | Look in the in-memory cache, in case this batch was signed before |
 | 3b | On a cache miss, look in the signature store; a hit fills the cache |
-| 3c | On a store miss, take the Tango path |
+| 3c | On a store miss, take the Tango path; this is the only path that calls Tango |
 | 3d | The change URIs feed the Tango request |
 | 3e | The base revision feeds the Tango request |
 | 3f | The request goes to Tango |
 | 3g | Changed targets and metadata come back to the converter |
 | 3h | The converter creates the signature, keeping any existing record, and fills the cache |
 | 3i | The converter sends labels to the dictionary, asynchronously |
-| 4 | The analyzer compares each signature |
-| 5 | The analyzer returns the conflicts to dependency analysis |
+| 4 | The analyzer reads the signature of each in-flight batch |
+| 5a | Look in the in-memory cache |
+| 5b | On a cache miss, look in the signature store; a hit fills the cache, and a miss fails the analysis, with no Tango call |
+| 6 | The analyzer compares each signature |
+| 7 | The analyzer returns the conflicts to dependency analysis |
 
 ## Stores and caches
 
@@ -209,21 +216,24 @@ Any of these fails the analysis, and a failure never becomes "no conflicts", bec
 
 ## Algorithm
 
-Two batches conflict when their ID sets intersect; distance is stored for relaxation and does not affect the decision. Names are descriptive, not a proposed API. In the [Data flow](#data-flow) diagram, "get signature" is `signatureFor`, "build Tango request" is `requestFor`, and "convert response" is `convert`.
+Two batches conflict when their ID sets intersect; distance is stored for relaxation and does not affect the decision. Names are descriptive, not a proposed API. In the [Data flow](#data-flow) diagram, "sign new batch" is `signNew`, "read signatures" is `recordedSignature` for each in-flight batch, "build Tango request" is `requestFor`, and "convert response" is `convert`.
 
 ```go
 // Analyze returns the in-flight batches whose signatures share an ID with the
 // batch's, in in-flight order. A failure to get any signature fails the analysis.
 func Analyze(ctx, batch, inFlight) ([]Conflict, error) {
-    mine, err := signatureFor(ctx, batch)
+    mine, err := signNew(ctx, batch)
     if err != nil {
         return nil, err
     }
     var conflicts []Conflict
     for _, other := range inFlight {
-        theirs, err := signatureFor(ctx, other)
+        theirs, ok, err := recordedSignature(ctx, other)
         if err != nil {
             return nil, err
+        }
+        if !ok {
+            return nil, ErrNoSignature // an in-flight batch was admitted with a signature; never ask Tango for it
         }
         if intersects(ids(mine), ids(theirs)) {
             conflicts = append(conflicts, Conflict{other.ID, ConflictTypeTargetOverlap})
@@ -233,20 +243,28 @@ func Analyze(ctx, batch, inFlight) ([]Conflict, error) {
     return conflicts, nil
 }
 
-// signatureFor returns b's signature from the cache, then the store, then Tango.
-// A signature computed from Tango is created in the store before it is returned,
-// so every reader sees the same one.
-func signatureFor(ctx, b Batch) (Signature, error) {
+// recordedSignature returns b's signature from the cache, then the store. It
+// never calls Tango.
+func recordedSignature(ctx, b Batch) (Signature, bool, error) {
     if sig, ok := cache.Get(b.Queue, b.ID); ok {
-        return sig, nil
+        return sig, true, nil
     }
     sig, ok, err := store.Get(ctx, b.Queue, b.ID)
-    if err != nil {
-        return Signature{}, err
+    if err != nil || !ok {
+        return Signature{}, false, err
     }
-    if ok {
-        cache.Put(b.Queue, b.ID, sig)
-        return sig, nil
+    cache.Put(b.Queue, b.ID, sig)
+    return sig, true, nil
+}
+
+// signNew returns the signature of the batch being admitted. A record exists
+// only if an earlier attempt on this batch got this far and a later step failed,
+// so it is used as it stands. Otherwise Tango is called, and the signature is
+// created in the store before it is returned, so every reader sees the same one.
+func signNew(ctx, b Batch) (Signature, error) {
+    sig, ok, err := recordedSignature(ctx, b)
+    if err != nil || ok {
+        return sig, err
     }
 
     resp, err := tango.GetChangedTargets(ctx, requestFor(b)) // newest base
@@ -271,11 +289,13 @@ func signatureFor(ctx, b Batch) (Signature, error) {
 }
 ```
 
-- **Steady state** costs one Tango call, for the batch itself, and no store reads, because every in-flight batch was cached when it was admitted. A batch with no record anywhere, such as one admitted before the queue switched to `tango`, costs a Tango call.
-- **Cold start.** After a restart, deploy or rebalance, the in-memory cache is empty, so the first analysis reads one signature per in-flight batch from the signature store instead of calling Tango. The cost grows with the number of in-flight batches: at about 5 ms per point read, done in parallel, roughly 2,000 batches load in about a second and 20,000 in about ten. Beyond that range a target-to-batch posting index would be the next step.
+- **Steady state** costs one Tango call and one store read, both for the new batch itself; the read finds nothing unless an earlier attempt already signed it. In-flight batches cost no reads, because each was cached when it was admitted.
+- **Failing closed.** A store error or a missing record for an in-flight batch fails the analysis, and Tango is never asked for it. A signature recomputed later would use a newer base and could differ from the one the batch was admitted with, and a systematic store problem would otherwise turn into a burst of Tango calls that hides the original fault.
+- **Switching a queue to `tango`.** Batches admitted before the switch have no record, so the in-flight set must be empty at the switch: drain or pause the queue first. Backfilling signatures for in-flight batches is out of scope.
+- **Cold start.** After a restart, deploy or rebalance, the in-memory cache is empty, so the first analysis reads one signature per in-flight batch from the signature store. The cost grows with the number of in-flight batches: at about 5 ms per point read, done in parallel, roughly 2,000 batches load in about a second and 20,000 in about ten. Beyond that range a target-to-batch posting index would be the next step.
 - **Eviction** drops the queue's cached signatures for batches not in `inFlight`, so memory tracks the in-flight set. That rule only runs when the queue is analyzed, so a byte-bounded LRU across all queues backs it up for queues that go idle or move to another controller. A wrong eviction costs one store read, so the budget needs no careful tuning.
 - **Concurrency.** Dependency analysis is partitioned by queue, so one queue is analyzed at a time. Signature lookups for different batches may run at the same time, up to a fixed limit.
-- **Idempotency.** A redelivery finds its own record and reaches the same signature.
+- **Idempotency.** A redelivery after the new batch was signed finds its own record in the cache or store and reaches the same signature without calling Tango.
 
 ## Known gap: missed conflicts
 
@@ -332,6 +352,7 @@ For each `CHANGED` target the rule keeps the dependencies in the new list but no
 ## Rejected alternatives
 
 - **Tango's whole response as the signature.** The largest responses have millions of targets, so one takes gigabytes of heap, and a few of them in flight make a cold start slow.
+- **Falling back to Tango for an in-flight batch with no record.** It would mask a store fault, send Tango a burst of requests exactly when something is already wrong, and produce a signature from a newer base than the one the batch was admitted with.
 - **Sorted labels.** Roughly an order of magnitude larger to store and to hold in memory than IDs, before counting the dictionary, with no benefit the dictionary does not already give.
 
 ## Open questions
