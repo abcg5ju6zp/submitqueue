@@ -70,4 +70,7 @@ type Storage interface {
 
 	// GetPathBuildStore returns the PathBuildStore instance.
 	GetPathBuildStore() basestorage.PathBuildStore
+
+	// GetTargetSignatureStore returns the TargetSignatureStore instance.
+	GetTargetSignatureStore() basestorage.TargetSignatureStore
 }

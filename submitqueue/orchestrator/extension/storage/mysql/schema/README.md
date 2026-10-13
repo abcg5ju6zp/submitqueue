@@ -2,7 +2,7 @@
 
 ## Queue-leading primary keys
 
-Every table leads its primary key with `queue`: `request` and `batch` on `(queue, id)`, `build` on `(queue, id)`, `batch_dependent` on `(queue, batch_id)`, `request_batch` on `(queue, request_id, batch_id)`, `change` on `(queue, uri, request_id)`, `queue_batch_state` on `(queue, state, batch_id)`, and `speculation_path_set` on `(queue, head)`. A queue-bound store instance prefixes every read and stamps every write with its bound queue, so one queue's rows are unreachable through another queue's binding and every table is shardable by queue. `//tool/linter/queueshard` enforces this, and also rejects any secondary index that does not itself lead with `queue`, since such an index would reintroduce a cross-queue access path.
+Every table leads its primary key with `queue`: `request` and `batch` on `(queue, id)`, `build` on `(queue, id)`, `batch_dependent` on `(queue, batch_id)`, `request_batch` on `(queue, request_id, batch_id)`, `change` on `(queue, uri, request_id)`, `queue_batch_state` on `(queue, state, batch_id)`, `speculation_path_set` on `(queue, head)`, and `target_signature` on `(queue, batch_id)`. A queue-bound store instance prefixes every read and stamps every write with its bound queue, so one queue's rows are unreachable through another queue's binding and every table is shardable by queue. `//tool/linter/queueshard` enforces this, and also rejects any secondary index that does not itself lead with `queue`, since such an index would reintroduce a cross-queue access path.
 
 The `build` key also removes a cross-queue uniqueness assumption: build IDs are runner-minted, so two queues sharing one CI pipeline may legitimately mint the same identifier. `speculation_path_set` relies on the same property for its head: a batch ID is unique only within its queue.
 
@@ -27,3 +27,7 @@ Terminal-state records (and their batches) accumulate as the queue processes wor
 ### Composite primary key: `(queue, uri, request_id)`
 
 The `change` table records per-URI claims by in-flight requests. `request_id` is part of the primary key so that concurrent claims on the same URI by different requests coexist as distinct rows — a same-request retry collides on the PK and is a no-op (`INSERT IGNORE`), while a different-request claim is a new row that `GetByURI` surfaces for overlap detection. `queue` leads the key so queue-scoped lookups are primary-key-prefix scans and the table is shardable by queue.
+
+## target_signature table
+
+`target_signature` holds one row per batch: the base revision the signature was computed at and the batch's affected targets as sorted `(id, distance)` entries (see `entity.TargetSignature`). Rows are written once and never updated. `targets` is a flat binary encoding, per entry an 8-byte big-endian ID followed by a signed varint distance, stored as `LONGBLOB` because the largest signatures run to tens of megabytes. The encoding lives in `target_signature_codec.go`. MySQL's `max_allowed_packet` is a separate limit and must be sized for the largest signature a deployment expects.

@@ -419,6 +419,73 @@ func (s *StorageContractSuite) TestStorage_QueueBatchStateRecordLifecycle() {
 	assert.ElementsMatch(t, []entity.QueueBatchState{otherQueue}, got)
 }
 
+func (s *StorageContractSuite) TestStorage_TargetSignatureStore() {
+	t := s.T()
+	ctx := s.ctx
+	storeA := s.forQueue("sig-queue-a").GetTargetSignatureStore()
+	storeB := s.forQueue("sig-queue-b").GetTargetSignatureStore()
+
+	// 100k entries encode to roughly 900KB, beyond a BLOB column's 64KB.
+	large := make([]entity.SignatureTarget, 100000)
+	for i := range large {
+		large[i] = entity.SignatureTarget{ID: uint64(i) * 3, Distance: int32(i % 5)}
+	}
+
+	tests := []struct {
+		name      string
+		signature entity.TargetSignature
+	}{
+		{
+			name: "several targets",
+			signature: entity.TargetSignature{
+				Queue: "sig-queue-a", BatchID: "small", BaseRevision: "rev-1", CreatedAt: 1700000000000,
+				Targets: []entity.SignatureTarget{{ID: 1, Distance: 0}, {ID: 1 << 63, Distance: 2}, {ID: ^uint64(0), Distance: 7}},
+			},
+		},
+		{
+			name:      "empty signature",
+			signature: entity.TargetSignature{Queue: "sig-queue-a", BatchID: "empty", BaseRevision: "rev-1", CreatedAt: 1},
+		},
+		{
+			name:      "large signature",
+			signature: entity.TargetSignature{Queue: "sig-queue-a", BatchID: "large", BaseRevision: "rev-2", CreatedAt: 2, Targets: large},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, storeA.Create(ctx, tt.signature))
+
+			got, found, err := storeA.Get(ctx, tt.signature.BatchID)
+			require.NoError(t, err)
+			require.True(t, found)
+			assert.Equal(t, tt.signature, got)
+		})
+	}
+
+	t.Run("missing batch is not found", func(t *testing.T) {
+		_, found, err := storeA.Get(ctx, "missing")
+		require.NoError(t, err)
+		assert.False(t, found)
+	})
+
+	t.Run("second create keeps the first signature", func(t *testing.T) {
+		duplicate := entity.TargetSignature{Queue: "sig-queue-a", BatchID: "small", BaseRevision: "rev-other", CreatedAt: 9}
+		require.ErrorIs(t, storeA.Create(ctx, duplicate), storage.ErrAlreadyExists)
+
+		got, found, err := storeA.Get(ctx, "small")
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "rev-1", got.BaseRevision)
+	})
+
+	t.Run("invisible through another queue", func(t *testing.T) {
+		_, found, err := storeB.Get(ctx, "small")
+		require.NoError(t, err)
+		assert.False(t, found)
+		require.Error(t, storeB.Create(ctx, entity.TargetSignature{Queue: "sig-queue-a", BatchID: "mismatch"}), "a mismatched-queue write must be rejected")
+	})
+}
+
 // TestStorage_QueueIsolation verifies a store aggregate bound to one queue can
 // neither read nor write another queue's records: cross-queue reads miss, and
 // writes whose entity queue disagrees with the binding are rejected.
