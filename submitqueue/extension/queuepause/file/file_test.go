@@ -42,6 +42,9 @@ queues:
   - name: both
     reject_lands: true
     freeze_processing: true
+  - name: with-reason
+    reject_lands: true
+    reason: repo freeze until 17:00
   - name: listed-but-running
 `
 	tests := []struct {
@@ -52,6 +55,7 @@ queues:
 		{name: "reject only", queue: "rejecting", want: entity.QueuePause{RejectLands: true}},
 		{name: "freeze only", queue: "freezing", want: entity.QueuePause{FreezeProcessing: true}},
 		{name: "both switches", queue: "both", want: entity.QueuePause{RejectLands: true, FreezeProcessing: true}},
+		{name: "reason is carried", queue: "with-reason", want: entity.QueuePause{RejectLands: true, Reason: "repo freeze until 17:00"}},
 		{name: "listed with no switches set", queue: "listed-but-running", want: entity.QueuePause{}},
 		{name: "unlisted queue is not paused", queue: "other", want: entity.QueuePause{}},
 	}

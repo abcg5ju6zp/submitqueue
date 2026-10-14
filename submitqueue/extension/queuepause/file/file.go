@@ -20,6 +20,7 @@
 //	  - name: my-queue
 //	    reject_lands: true
 //	    freeze_processing: false
+//	    reason: repo freeze until 17:00
 //
 // A queue with no entry is not paused. The file must exist and parse when the
 // Store is constructed, so a mistyped path fails at startup. A later read or
@@ -49,6 +50,7 @@ type queueEntry struct {
 	Name             string `yaml:"name"`
 	RejectLands      bool   `yaml:"reject_lands"`
 	FreezeProcessing bool   `yaml:"freeze_processing"`
+	Reason           string `yaml:"reason"`
 }
 
 // Store is a queuepause.Store backed by a YAML file that is re-read on every
@@ -103,6 +105,7 @@ func load(path string) (map[string]entity.QueuePause, error) {
 		states[q.Name] = entity.QueuePause{
 			RejectLands:      q.RejectLands,
 			FreezeProcessing: q.FreezeProcessing,
+			Reason:           q.Reason,
 		}
 	}
 	return states, nil
