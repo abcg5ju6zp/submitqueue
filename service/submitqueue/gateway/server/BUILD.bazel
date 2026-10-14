@@ -89,6 +89,7 @@ go_test(
     embed = [":gateway_lib"],  # keep
     deps = [
         "//api/submitqueue/gateway/protopb:go_default_library",
+        "//platform/errs:go_default_library",
         "//submitqueue/entity:go_default_library",
         "//submitqueue/extension/queueconfig/mock:go_default_library",
         "//submitqueue/gateway/controller:go_default_library",

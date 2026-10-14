@@ -152,6 +152,8 @@ func (s *GatewayServer) GetRequestHistoryByChangeURI(ctx context.Context, req *p
 	return &pb.GetRequestHistoryByChangeURIResponse{Histories: mapper.RequestHistoriesToProto(histories)}, nil
 }
 
+// gatewayStatusError maps controller errors to status codes. IsInvalidRequest
+// matches every user error, so each specific user error is checked before it.
 func gatewayStatusError(err error) error {
 	switch {
 	case controller.IsRequestNotFound(err):
@@ -160,10 +162,10 @@ func gatewayStatusError(err error) error {
 		return status.Error(codes.ResourceExhausted, err.Error())
 	case controller.IsInternalConsistency(err):
 		return status.Error(codes.Internal, err.Error())
-	case controller.IsInvalidRequest(err), controller.IsUnrecognizedQueue(err):
-		return status.Error(codes.InvalidArgument, err.Error())
 	case controller.IsQueuePaused(err):
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case controller.IsInvalidRequest(err), controller.IsUnrecognizedQueue(err):
+		return status.Error(codes.InvalidArgument, err.Error())
 	default:
 		return err
 	}
