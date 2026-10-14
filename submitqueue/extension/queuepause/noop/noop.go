@@ -33,6 +33,6 @@ func New() Store {
 }
 
 // Get always returns the zero state.
-func (Store) Get(context.Context, string) (entity.QueuePauseState, error) {
-	return entity.QueuePauseState{}, nil
+func (Store) Get(context.Context, string) (entity.QueuePause, error) {
+	return entity.QueuePause{}, nil
 }

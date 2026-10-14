@@ -28,7 +28,7 @@ func TestGetNeverPauses(t *testing.T) {
 		t.Run(queue, func(t *testing.T) {
 			got, err := New().Get(context.Background(), queue)
 			require.NoError(t, err)
-			assert.Equal(t, entity.QueuePauseState{}, got)
+			assert.Equal(t, entity.QueuePause{}, got)
 		})
 	}
 }

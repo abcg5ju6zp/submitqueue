@@ -47,13 +47,13 @@ queues:
 	tests := []struct {
 		name  string
 		queue string
-		want  entity.QueuePauseState
+		want  entity.QueuePause
 	}{
-		{name: "reject only", queue: "rejecting", want: entity.QueuePauseState{RejectLands: true}},
-		{name: "freeze only", queue: "freezing", want: entity.QueuePauseState{FreezeProcessing: true}},
-		{name: "both switches", queue: "both", want: entity.QueuePauseState{RejectLands: true, FreezeProcessing: true}},
-		{name: "listed with no switches set", queue: "listed-but-running", want: entity.QueuePauseState{}},
-		{name: "unlisted queue is not paused", queue: "other", want: entity.QueuePauseState{}},
+		{name: "reject only", queue: "rejecting", want: entity.QueuePause{RejectLands: true}},
+		{name: "freeze only", queue: "freezing", want: entity.QueuePause{FreezeProcessing: true}},
+		{name: "both switches", queue: "both", want: entity.QueuePause{RejectLands: true, FreezeProcessing: true}},
+		{name: "listed with no switches set", queue: "listed-but-running", want: entity.QueuePause{}},
+		{name: "unlisted queue is not paused", queue: "other", want: entity.QueuePause{}},
 	}
 	store, err := NewStore(writeFile(t, contents))
 	require.NoError(t, err)
@@ -73,7 +73,7 @@ func TestNewStoreEmptyFile(t *testing.T) {
 
 	got, err := store.Get(context.Background(), "any")
 	require.NoError(t, err)
-	assert.Equal(t, entity.QueuePauseState{}, got)
+	assert.Equal(t, entity.QueuePause{}, got)
 }
 
 func TestNewStoreRejectsInvalidFile(t *testing.T) {
@@ -106,12 +106,12 @@ func TestGetReflectsFileChanges(t *testing.T) {
 
 	got, err := store.Get(context.Background(), "q")
 	require.NoError(t, err)
-	assert.Equal(t, entity.QueuePauseState{}, got)
+	assert.Equal(t, entity.QueuePause{}, got)
 
 	require.NoError(t, os.WriteFile(path, []byte("queues:\n  - name: q\n    reject_lands: true\n"), 0o600))
 	got, err = store.Get(context.Background(), "q")
 	require.NoError(t, err)
-	assert.Equal(t, entity.QueuePauseState{RejectLands: true}, got)
+	assert.Equal(t, entity.QueuePause{RejectLands: true}, got)
 }
 
 func TestGetFailsWhenFileBecomesUnreadable(t *testing.T) {

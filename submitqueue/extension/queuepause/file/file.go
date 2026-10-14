@@ -69,15 +69,15 @@ func NewStore(path string) (Store, error) {
 
 // Get re-reads the file and returns the pause state of the named queue, or the
 // zero state if the queue has no entry.
-func (s Store) Get(_ context.Context, queue string) (entity.QueuePauseState, error) {
+func (s Store) Get(_ context.Context, queue string) (entity.QueuePause, error) {
 	states, err := load(s.path)
 	if err != nil {
-		return entity.QueuePauseState{}, err
+		return entity.QueuePause{}, err
 	}
 	return states[queue], nil
 }
 
-func load(path string) (map[string]entity.QueuePauseState, error) {
+func load(path string) (map[string]entity.QueuePause, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read queue pause file %q: %w", path, err)
@@ -92,7 +92,7 @@ func load(path string) (map[string]entity.QueuePauseState, error) {
 		return nil, fmt.Errorf("failed to parse queue pause file %q: %w", path, err)
 	}
 
-	states := make(map[string]entity.QueuePauseState, len(contents.Queues))
+	states := make(map[string]entity.QueuePause, len(contents.Queues))
 	for _, q := range contents.Queues {
 		if q.Name == "" {
 			return nil, fmt.Errorf("queue pause entry in %q has empty name", path)
@@ -100,7 +100,7 @@ func load(path string) (map[string]entity.QueuePauseState, error) {
 		if _, dup := states[q.Name]; dup {
 			return nil, fmt.Errorf("queue pause file %q has duplicate name %q", path, q.Name)
 		}
-		states[q.Name] = entity.QueuePauseState{
+		states[q.Name] = entity.QueuePause{
 			RejectLands:      q.RejectLands,
 			FreezeProcessing: q.FreezeProcessing,
 		}
