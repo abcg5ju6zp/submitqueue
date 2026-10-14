@@ -51,7 +51,7 @@ node_convert -->|"3h. create, existing record kept, fills cache"| node_sigstore
 node_convert -->|"3i. labels, async"| node_dict
 node_analyze -->|"4. read each in-flight signature"| node_lookup
 node_lookup -->|"5a. look up"| node_cache
-node_lookup -->|"5b. on cache miss, fills cache on hit; a miss fails the analysis"| node_sigstore
+node_lookup -->|"5b. on cache miss, fills cache on hit, a miss fails the analysis"| node_sigstore
 node_analyze -->|"6. then compare"| node_compare
 node_analyze -->|"7. conflicts"| node_stage
 node_sigstore -.->|"later: reads"| node_relax
@@ -363,4 +363,4 @@ For each `CHANGED` target the rule keeps the dependencies in the new list but no
 - **Oversized signatures.** `LONGBLOB` avoids MySQL column limits, but a backend with an item limit would need either chunking or a size cap that treats such a batch as conflicting with everything. Deferred until rollout data shows how many real batches are that large.
 - **Recording added edges and targets.** Whether each signature records, at admission, that its batch added a dependency edge or a target. Inheritance needs it, so the Collect step of [Response to signature](#tango-request-and-response), which keeps only IDs and distances today, would have to read the dependency lists. Without it, inheritance can only apply to batches admitted after it ships.
 - **Dependency lists.** The proto carries `direct_dependencies` on `old_target` and `new_target`; whether both are populated for every changed target is unconfirmed.
-- **Retention.** Whether signature and dictionary rows are deleted on terminal state or left to a general retention policy.
+- **Retention.** Whether signature rows are deleted on terminal state or left to a general retention policy. Dictionary rows are shared across batches and have no batch to attach a deletion to, so only a queue-level policy applies to them.
