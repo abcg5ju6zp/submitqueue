@@ -23,4 +23,7 @@ type QueuePauseState struct {
 
 	// FreezeProcessing is true while the queue's accepted requests are not advanced.
 	FreezeProcessing bool
+
+	// Reason is the operator's free-text explanation for the pause. Empty when none was given.
+	Reason string
 }
