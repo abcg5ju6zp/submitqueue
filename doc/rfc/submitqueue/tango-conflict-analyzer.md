@@ -98,7 +98,7 @@ class node_relax toneNeutral
 | **Durable** | Yes | Yes | No |
 | **Written** | Once per batch, create-if-absent, before the batch is promoted to `Created` | When a Tango response is decoded; asynchronous, best-effort, idempotent | On a miss, after the store or Tango answers |
 | **Read by** | The analyzer; relaxation | Debugging and conflict explanations; never the conflict check | The analyzer |
-| **Lifetime** | Created once, never updated | Created once, never updated | Evicted when a batch leaves the in-flight set, or LRU when over the memory budget |
+| **Lifetime** | Created once, never updated | Per queue; a row is added when a batch first brings its target, then never changed | Evicted when a batch leaves the in-flight set, or LRU when over the memory budget |
 
 The two stores are interfaces under `submitqueue/extension/storage`, added to the orchestrator's storage interface only, so the gateway cannot reach them. MySQL is the first implementation.
 
