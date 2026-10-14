@@ -1345,8 +1345,8 @@ func (x *GetQueueStatusRequest) GetChangeUri() string {
 	return ""
 }
 
-// QueueState describes applied enablement.
-type QueueState struct {
+// QueueEnablementStatus describes applied enablement.
+type QueueEnablementStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Positive enablement sequence, increasing with each state change.
 	Version int64 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
@@ -1360,20 +1360,20 @@ type QueueState struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *QueueState) Reset() {
-	*x = QueueState{}
+func (x *QueueEnablementStatus) Reset() {
+	*x = QueueEnablementStatus{}
 	mi := &file_stovepipe_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *QueueState) String() string {
+func (x *QueueEnablementStatus) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*QueueState) ProtoMessage() {}
+func (*QueueEnablementStatus) ProtoMessage() {}
 
-func (x *QueueState) ProtoReflect() protoreflect.Message {
+func (x *QueueEnablementStatus) ProtoReflect() protoreflect.Message {
 	mi := &file_stovepipe_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1385,33 +1385,33 @@ func (x *QueueState) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use QueueState.ProtoReflect.Descriptor instead.
-func (*QueueState) Descriptor() ([]byte, []int) {
+// Deprecated: Use QueueEnablementStatus.ProtoReflect.Descriptor instead.
+func (*QueueEnablementStatus) Descriptor() ([]byte, []int) {
 	return file_stovepipe_proto_rawDescGZIP(), []int{17}
 }
 
-func (x *QueueState) GetVersion() int64 {
+func (x *QueueEnablementStatus) GetVersion() int64 {
 	if x != nil {
 		return x.Version
 	}
 	return 0
 }
 
-func (x *QueueState) GetState() QueueEnablement {
+func (x *QueueEnablementStatus) GetState() QueueEnablement {
 	if x != nil {
 		return x.State
 	}
 	return QueueEnablement_QUEUE_ENABLEMENT_UNKNOWN
 }
 
-func (x *QueueState) GetEffectiveFromCommitUri() string {
+func (x *QueueEnablementStatus) GetEffectiveFromCommitUri() string {
 	if x != nil {
 		return x.EffectiveFromCommitUri
 	}
 	return ""
 }
 
-func (x *QueueState) GetChangedAtMs() int64 {
+func (x *QueueEnablementStatus) GetChangedAtMs() int64 {
 	if x != nil {
 		return x.ChangedAtMs
 	}
@@ -1422,8 +1422,8 @@ type GetQueueStatusResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Queue selected by the request.
 	Queue string `protobuf:"bytes,1,opt,name=queue,proto3" json:"queue,omitempty"`
-	// Current enablement when change_uri is empty; otherwise enablement covering that commit.
-	State         *QueueState `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	// Current enablement, or enablement covering change_uri. Always present on success.
+	Enablement    *QueueEnablementStatus `protobuf:"bytes,2,opt,name=enablement,proto3" json:"enablement,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1465,9 +1465,9 @@ func (x *GetQueueStatusResponse) GetQueue() string {
 	return ""
 }
 
-func (x *GetQueueStatusResponse) GetState() *QueueState {
+func (x *GetQueueStatusResponse) GetEnablement() *QueueEnablementStatus {
 	if x != nil {
-		return x.State
+		return x.Enablement
 	}
 	return nil
 }
@@ -1566,16 +1566,17 @@ const file_stovepipe_proto_rawDesc = "" +
 	"\x15GetQueueStatusRequest\x12\x14\n" +
 	"\x05queue\x18\x01 \x01(\tR\x05queue\x12\x1d\n" +
 	"\n" +
-	"change_uri\x18\x02 \x01(\tR\tchangeUri\"\xc8\x01\n" +
-	"\n" +
-	"QueueState\x12\x18\n" +
+	"change_uri\x18\x02 \x01(\tR\tchangeUri\"\xd3\x01\n" +
+	"\x15QueueEnablementStatus\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x03R\aversion\x12A\n" +
 	"\x05state\x18\x02 \x01(\x0e2+.uber.submitqueue.stovepipe.QueueEnablementR\x05state\x129\n" +
 	"\x19effective_from_commit_uri\x18\x03 \x01(\tR\x16effectiveFromCommitUri\x12\"\n" +
-	"\rchanged_at_ms\x18\x04 \x01(\x03R\vchangedAtMs\"l\n" +
+	"\rchanged_at_ms\x18\x04 \x01(\x03R\vchangedAtMs\"\x81\x01\n" +
 	"\x16GetQueueStatusResponse\x12\x14\n" +
-	"\x05queue\x18\x01 \x01(\tR\x05queue\x12<\n" +
-	"\x05state\x18\x02 \x01(\v2&.uber.submitqueue.stovepipe.QueueStateR\x05state*l\n" +
+	"\x05queue\x18\x01 \x01(\tR\x05queue\x12Q\n" +
+	"\n" +
+	"enablement\x18\x02 \x01(\v21.uber.submitqueue.stovepipe.QueueEnablementStatusR\n" +
+	"enablement*l\n" +
 	"\x0fQueueEnablement\x12\x1c\n" +
 	"\x18QUEUE_ENABLEMENT_UNKNOWN\x10\x00\x12\x1c\n" +
 	"\x18QUEUE_ENABLEMENT_ENABLED\x10\x01\x12\x1d\n" +
@@ -1623,7 +1624,7 @@ var file_stovepipe_proto_goTypes = []any{
 	(*ListRequest)(nil),                    // 15: uber.submitqueue.stovepipe.ListRequest
 	(*ListResponse)(nil),                   // 16: uber.submitqueue.stovepipe.ListResponse
 	(*GetQueueStatusRequest)(nil),          // 17: uber.submitqueue.stovepipe.GetQueueStatusRequest
-	(*QueueState)(nil),                     // 18: uber.submitqueue.stovepipe.QueueState
+	(*QueueEnablementStatus)(nil),          // 18: uber.submitqueue.stovepipe.QueueEnablementStatus
 	(*GetQueueStatusResponse)(nil),         // 19: uber.submitqueue.stovepipe.GetQueueStatusResponse
 }
 var file_stovepipe_proto_depIdxs = []int32{
@@ -1634,8 +1635,8 @@ var file_stovepipe_proto_depIdxs = []int32{
 	8,  // 4: uber.submitqueue.stovepipe.GetRequestHistoryByURIResponse.histories:type_name -> uber.submitqueue.stovepipe.RequestHistory
 	12, // 5: uber.submitqueue.stovepipe.GetProjectStatusByURIResponse.projects:type_name -> uber.submitqueue.stovepipe.ProjectValidation
 	14, // 6: uber.submitqueue.stovepipe.ListResponse.requests:type_name -> uber.submitqueue.stovepipe.RequestSummary
-	0,  // 7: uber.submitqueue.stovepipe.QueueState.state:type_name -> uber.submitqueue.stovepipe.QueueEnablement
-	18, // 8: uber.submitqueue.stovepipe.GetQueueStatusResponse.state:type_name -> uber.submitqueue.stovepipe.QueueState
+	0,  // 7: uber.submitqueue.stovepipe.QueueEnablementStatus.state:type_name -> uber.submitqueue.stovepipe.QueueEnablement
+	18, // 8: uber.submitqueue.stovepipe.GetQueueStatusResponse.enablement:type_name -> uber.submitqueue.stovepipe.QueueEnablementStatus
 	1,  // 9: uber.submitqueue.stovepipe.Stovepipe.Ping:input_type -> uber.submitqueue.stovepipe.PingRequest
 	3,  // 10: uber.submitqueue.stovepipe.Stovepipe.Ingest:input_type -> uber.submitqueue.stovepipe.IngestRequest
 	5,  // 11: uber.submitqueue.stovepipe.Stovepipe.GetRequestHistoryByID:input_type -> uber.submitqueue.stovepipe.GetRequestHistoryByIDRequest
