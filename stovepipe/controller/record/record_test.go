@@ -160,11 +160,17 @@ func newControllerForTopic(t *testing.T, ctrl *gomock.Controller, topicKey consu
 	m.store.EXPECT().GetValidationFactStore().Return(m.factStore).AnyTimes()
 	m.materializer.EXPECT().PersistLog(gomock.Any(), m.store, gomock.Any()).DoAndReturn(
 		func(_ context.Context, _ storage.Storage, log entity.RequestLog) error {
-			assert.Equal(t, entity.RequestEventValidationFactRecorded, log.Event)
 			assert.Empty(t, log.State)
 			assert.Zero(t, log.RequestVersion)
 			assert.Empty(t, log.OutcomeReason)
-			assert.NotEmpty(t, log.Metadata[requestlog.MetadataKeyFactDegree])
+			switch log.Event {
+			case entity.RequestEventValidationFactRecorded:
+				assert.NotEmpty(t, log.Metadata[requestlog.MetadataKeyFactDegree])
+			case entity.RequestEventProjectFactsRecorded:
+				assert.NotEmpty(t, log.Metadata[requestlog.MetadataKeyProjectFactNames])
+			default:
+				t.Errorf("unexpected request event %q", log.Event)
+			}
 			return nil
 		},
 	).AnyTimes()
@@ -396,12 +402,16 @@ func TestProcess_RecordsNamedProjectStatusResults(t *testing.T) {
 	require.Len(t, logs, 2)
 	assert.Equal(t, entity.RequestEventValidationFactRecorded, logs[0].Event)
 	assert.Equal(t, entity.RequestEventProjectFactsRecorded, logs[1].Event)
-	assert.Equal(t, "2", logs[1].Metadata[requestlog.MetadataKeyProjectFactCount])
+	projects, err := requestlog.ProjectFactsRecordedNames(logs[1])
+	require.NoError(t, err)
+	assert.Equal(t, []string{"project-a", "project-b"}, projects)
 }
 
 func TestRecordProjectFacts_PassesEmptyTerminalBuild(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	c, m := newController(t, ctrl)
+	eventMaterializer := requestlogmock.NewMockMaterializer(ctrl)
+	c.materializer = eventMaterializer
 	request := requestWithState(entity.RequestStateFailed)
 	request.TerminalBuildID = ""
 	projectStatusResolverFactory := projectstatusmock.NewMockResolverFactory(ctrl)
@@ -410,9 +420,18 @@ func TestRecordProjectFacts_PassesEmptyTerminalBuild(t *testing.T) {
 	projectStatusResolverFactory.EXPECT().For(projectstatus.ResolverConfig{QueueName: testQueue}).
 		Return(projectStatusResolver, nil)
 	projectStatusResolver.EXPECT().Resolve(gomock.Any(), request, "").Return(nil, nil)
+	var completion entity.RequestLog
+	eventMaterializer.EXPECT().PersistLog(gomock.Any(), m.store, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ storage.Storage, log entity.RequestLog) error {
+			completion = log
+			return nil
+		})
 
 	err := c.recordProjectFacts(queueContext(), m.store, request)
 	require.NoError(t, err)
+	projects, err := requestlog.ProjectFactsRecordedNames(completion)
+	require.NoError(t, err)
+	assert.Empty(t, projects)
 }
 
 func TestProcess_RejectsInvalidProjectStatusResultsBeforeWritingFacts(t *testing.T) {
@@ -533,20 +552,28 @@ func TestProcess_RecordsFactEventBeforeDerivedWork(t *testing.T) {
 	var fact entity.ValidationFact
 	m.expectFactCreated(&fact)
 
-	eventPersisted := false
+	factEventPersisted := false
+	projectEventPersisted := false
 	eventMaterializer.EXPECT().PersistLog(gomock.Any(), m.store, gomock.Any()).DoAndReturn(
 		func(_ context.Context, _ storage.Storage, log entity.RequestLog) error {
-			eventPersisted = true
-			assert.Equal(t, entity.RequestEventValidationFactRecorded, log.Event)
-			assert.Contains(t, log.ID, "event/validation_fact_recorded/")
-			assert.Equal(t, fact.CreatedAt, log.TimestampMs)
-			assert.Equal(t, "0", log.Metadata[requestlog.MetadataKeyFactDegree])
+			switch log.Event {
+			case entity.RequestEventValidationFactRecorded:
+				factEventPersisted = true
+				assert.Contains(t, log.ID, "event/validation_fact_recorded/")
+				assert.Equal(t, fact.CreatedAt, log.TimestampMs)
+				assert.Equal(t, "0", log.Metadata[requestlog.MetadataKeyFactDegree])
+			case entity.RequestEventProjectFactsRecorded:
+				projectEventPersisted = true
+			default:
+				t.Errorf("unexpected request event %q", log.Event)
+			}
 			return nil
 		},
-	)
+	).Times(2)
 	m.queueStore.EXPECT().Get(gomock.Any(), testQueue).DoAndReturn(
 		func(context.Context, string) (entity.Queue, error) {
-			require.True(t, eventPersisted)
+			require.True(t, factEventPersisted)
+			require.True(t, projectEventPersisted)
 			return queueRow("", "", 1), nil
 		},
 	)

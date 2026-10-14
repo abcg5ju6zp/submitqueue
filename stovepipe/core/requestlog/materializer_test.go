@@ -334,6 +334,46 @@ func TestNewRequestEventLogStableID(t *testing.T) {
 	assert.Equal(t, metadata, first.Metadata)
 }
 
+func TestProjectFactsRecordedLog(t *testing.T) {
+	request := entity.Request{ID: testRequestID, Queue: testQueue}
+	log, err := NewProjectFactsRecordedLog(request, []string{"project-b", "project-a"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "event/project_facts_recorded/all", log.ID)
+	assert.Equal(t, entity.RequestEventProjectFactsRecorded, log.Event)
+	projects, err := ProjectFactsRecordedNames(log)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"project-a", "project-b"}, projects)
+
+	empty, err := NewProjectFactsRecordedLog(request, nil)
+	require.NoError(t, err)
+	projects, err = ProjectFactsRecordedNames(empty)
+	require.NoError(t, err)
+	assert.Empty(t, projects)
+}
+
+func TestProjectFactsRecordedNamesRejectsInvalidLog(t *testing.T) {
+	tests := []struct {
+		name string
+		log  entity.RequestLog
+	}{
+		{name: "wrong event", log: entity.RequestLog{ID: "event/build", Event: entity.RequestEventBuildFinished}},
+		{name: "missing projects", log: entity.RequestLog{ID: "event/projects", Event: entity.RequestEventProjectFactsRecorded}},
+		{name: "malformed projects", log: entity.RequestLog{
+			ID:       "event/projects",
+			Event:    entity.RequestEventProjectFactsRecorded,
+			Metadata: map[string]string{MetadataKeyProjectFactNames: "{"},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ProjectFactsRecordedNames(tt.log)
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestSameSemanticOccurrenceMetadata(t *testing.T) {
 	base := entity.RequestLog{ID: "log/1", Queue: testQueue, RequestID: testRequestID, State: entity.RequestStateAccepted, RequestVersion: 1}
 	stored := base

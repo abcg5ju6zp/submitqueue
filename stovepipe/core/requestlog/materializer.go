@@ -19,8 +19,10 @@ package requestlog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -40,8 +42,8 @@ const (
 	MetadataKeyBuildID = "build_id"
 	// MetadataKeyFactDegree records the degree established by a validation fact.
 	MetadataKeyFactDegree = "fact_degree"
-	// MetadataKeyProjectFactCount records how many project facts a completed batch established.
-	MetadataKeyProjectFactCount = "project_fact_count"
+	// MetadataKeyProjectFactNames records the project names in a resolved project-fact set.
+	MetadataKeyProjectFactNames = "project_fact_names"
 	// MetadataKeyBaseURI records the selected build baseline; an empty value means a full build.
 	MetadataKeyBaseURI = "base_uri"
 )
@@ -101,6 +103,44 @@ func NewRequestEventLog(
 		Event:     event,
 		Metadata:  metadata,
 	}
+}
+
+// NewProjectFactsRecordedLog constructs the completion occurrence for a request's resolved project facts.
+func NewProjectFactsRecordedLog(request entity.Request, projects []string) (entity.RequestLog, error) {
+	ordered := make([]string, len(projects))
+	copy(ordered, projects)
+	sort.Strings(ordered)
+	encoded, err := json.Marshal(ordered)
+	if err != nil {
+		return entity.RequestLog{}, fmt.Errorf("encode project-facts completion occurrence: %w", err)
+	}
+	return NewRequestEventLog(
+		request,
+		entity.RequestEventProjectFactsRecorded,
+		"all",
+		map[string]string{
+			MetadataKeyProjectFactNames: string(encoded),
+		},
+	), nil
+}
+
+// ProjectFactsRecordedNames decodes the project names from a project-facts completion occurrence.
+func ProjectFactsRecordedNames(log entity.RequestLog) ([]string, error) {
+	if log.Event != entity.RequestEventProjectFactsRecorded {
+		return nil, fmt.Errorf("request log %s is not a project-facts completion occurrence", log.ID)
+	}
+	encoded, ok := log.Metadata[MetadataKeyProjectFactNames]
+	if !ok {
+		return nil, fmt.Errorf("project-facts completion occurrence %s has no project names", log.ID)
+	}
+	var projects []string
+	if err := json.Unmarshal([]byte(encoded), &projects); err != nil {
+		return nil, fmt.Errorf("decode projects from completion occurrence %s: %w", log.ID, err)
+	}
+	if projects == nil {
+		projects = []string{}
+	}
+	return projects, nil
 }
 
 func (m *materializer) PersistLog(ctx context.Context, stores storage.Storage, log entity.RequestLog) error {

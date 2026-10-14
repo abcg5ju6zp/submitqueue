@@ -196,7 +196,9 @@ func (c *Controller) recordProjectFacts(ctx context.Context, store storage.Stora
 	if err := validateProjectStatusResults(request, results); err != nil {
 		return err
 	}
+	projects := make([]string, 0, len(results))
 	for _, result := range results {
+		projects = append(projects, result.Project)
 		_, _, err := c.recordValidationFact(ctx, store.GetValidationFactStore(), entity.ValidationFact{
 			URI:       request.URI,
 			Project:   result.Project,
@@ -208,10 +210,7 @@ func (c *Controller) recordProjectFacts(ctx context.Context, store storage.Stora
 			return err
 		}
 	}
-	if len(results) == 0 {
-		return nil
-	}
-	return c.persistProjectFactsRecordedLog(ctx, store, request, len(results))
+	return c.persistProjectFactsRecordedLog(ctx, store, request, projects)
 }
 
 func validateProjectStatusResults(request entity.Request, results []projectstatus.Result) error {
@@ -235,14 +234,12 @@ func (c *Controller) persistProjectFactsRecordedLog(
 	ctx context.Context,
 	store storage.Storage,
 	request entity.Request,
-	count int,
+	projects []string,
 ) error {
-	log := requestlog.NewRequestEventLog(
-		request,
-		entity.RequestEventProjectFactsRecorded,
-		"all",
-		map[string]string{requestlog.MetadataKeyProjectFactCount: strconv.Itoa(count)},
-	)
+	log, err := requestlog.NewProjectFactsRecordedLog(request, projects)
+	if err != nil {
+		return fmt.Errorf("failed to construct project facts log for request %s: %w", request.ID, err)
+	}
 	if err := c.materializer.PersistLog(ctx, store, log); err != nil {
 		return fmt.Errorf("failed to record project facts for request %s: %w", request.ID, err)
 	}

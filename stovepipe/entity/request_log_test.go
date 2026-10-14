@@ -112,7 +112,7 @@ func TestRequestLogValidate(t *testing.T) {
 				entry.State = RequestStateUnknown
 				entry.Event = RequestEventProjectFactsRecorded
 				entry.RequestVersion = 0
-				entry.Metadata = map[string]string{"project_fact_count": "2"}
+				entry.Metadata = map[string]string{"project_fact_names": `["project-a","project-b"]`}
 				return entry
 			},
 		},
