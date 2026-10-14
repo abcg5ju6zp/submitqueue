@@ -16,15 +16,15 @@
 // @generated from file api/stovepipe/proto/stovepipe.proto (package uber.submitqueue.stovepipe, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
-import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
+import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
+import { enumDesc, fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file api/stovepipe/proto/stovepipe.proto.
  */
 export const file_api_stovepipe_proto_stovepipe: GenFile = /*@__PURE__*/
-  fileDesc("CiNhcGkvc3RvdmVwaXBlL3Byb3RvL3N0b3ZlcGlwZS5wcm90bxIadWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUiHgoLUGluZ1JlcXVlc3QSDwoHbWVzc2FnZRgBIAEoCSJaCgxQaW5nUmVzcG9uc2USDwoHbWVzc2FnZRgBIAEoCRIUCgxzZXJ2aWNlX25hbWUYAiABKAkSEQoJdGltZXN0YW1wGAMgASgDEhAKCGhvc3RuYW1lGAQgASgJIh4KDUluZ2VzdFJlcXVlc3QSDQoFcXVldWUYASABKAkiHAoOSW5nZXN0UmVzcG9uc2USCgoCaWQYASABKAkiQQocR2V0UmVxdWVzdEhpc3RvcnlCeUlEUmVxdWVzdBINCgVxdWV1ZRgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJIjsKHUdldFJlcXVlc3RIaXN0b3J5QnlVUklSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEgsKA3VyaRgCIAEoCSKGAQoMSGlzdG9yeUV2ZW50EhAKCGV2ZW50X2lkGAEgASgJEhQKDHRpbWVzdGFtcF9tcxgCIAEoAxIXCg1yZXF1ZXN0X3N0YXRlGAMgASgJSAASDwoFZXZlbnQYBCABKAlIABIWCg5vdXRjb21lX3JlYXNvbhgFIAEoCUIMCgpvY2N1cnJlbmNlIqMBCg5SZXF1ZXN0SGlzdG9yeRISCgpyZXF1ZXN0X2lkGAEgASgJEjgKBmV2ZW50cxgCIAMoCzIoLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkhpc3RvcnlFdmVudBJDCg9yZXF1ZXN0X3N1bW1hcnkYAyABKAsyKi51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5SZXF1ZXN0U3VtbWFyeSKeAQodR2V0UmVxdWVzdEhpc3RvcnlCeUlEUmVzcG9uc2USOAoGZXZlbnRzGAEgAygLMigudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuSGlzdG9yeUV2ZW50EkMKD3JlcXVlc3Rfc3VtbWFyeRgCIAEoCzIqLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLlJlcXVlc3RTdW1tYXJ5Il8KHkdldFJlcXVlc3RIaXN0b3J5QnlVUklSZXNwb25zZRI9CgloaXN0b3JpZXMYASADKAsyKi51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5SZXF1ZXN0SGlzdG9yeSJ6ChxHZXRQcm9qZWN0U3RhdHVzQnlVUklSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEhIKCmNoYW5nZV91cmkYAiABKAkSEAoIcHJvamVjdHMYAyADKAkSEQoJcGFnZV9zaXplGAQgASgFEhIKCnBhZ2VfdG9rZW4YBSABKAkiSQoRUHJvamVjdFZhbGlkYXRpb24SDwoHcHJvamVjdBgBIAEoCRIZCg9icmVha2FnZV9kZWdyZWUYAiABKAFIAEIICgZyZXN1bHQizQIKHUdldFByb2plY3RTdGF0dXNCeVVSSVJlc3BvbnNlEhIKCnJlcXVlc3RfaWQYASABKAkSDQoFcXVldWUYAiABKAkSEgoKY2hhbmdlX3VyaRgDIAEoCRIQCghiYXNlX3VyaRgEIAEoCRIVCg1yZXF1ZXN0X3N0YXRlGAUgASgJEhUKDXVwZGF0ZWRfYXRfbXMYCiABKAMSJAoacmVwb3NpdG9yeV9icmVha2FnZV9kZWdyZWUYBiABKAFIABIgChhwcm9qZWN0X3Jlc3VsdHNfY29tcGxldGUYByABKAgSPwoIcHJvamVjdHMYCCADKAsyLS51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5Qcm9qZWN0VmFsaWRhdGlvbhIXCg9uZXh0X3BhZ2VfdG9rZW4YCSABKAlCEwoRcmVwb3NpdG9yeV9yZXN1bHQivQEKDlJlcXVlc3RTdW1tYXJ5EhIKCnJlcXVlc3RfaWQYASABKAkSDQoFcXVldWUYAiABKAkSEgoKY2hhbmdlX3VyaRgDIAEoCRIQCghiYXNlX3VyaRgEIAEoCRIVCg1yZXF1ZXN0X3N0YXRlGAUgASgJEhsKE3N0YXRlX3VwZGF0ZWRfYXRfbXMYBiABKAMSFgoOYWNjZXB0ZWRfYXRfbXMYByABKAMSFgoOb3V0Y29tZV9yZWFzb24YCCABKAkitAEKC0xpc3RSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEiEKF2FjY2VwdGVkX2F0X29yX2FmdGVyX21zGAIgASgDSAASHAoSYWNjZXB0ZWRfYmVmb3JlX21zGAMgASgDSAESEQoJcGFnZV9zaXplGAQgASgFEhIKCnBhZ2VfdG9rZW4YBSABKAlCFgoUYWNjZXB0ZWRfbG93ZXJfYm91bmRCFgoUYWNjZXB0ZWRfdXBwZXJfYm91bmQiZQoMTGlzdFJlc3BvbnNlEjwKCHJlcXVlc3RzGAEgAygLMioudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuUmVxdWVzdFN1bW1hcnkSFwoPbmV4dF9wYWdlX3Rva2VuGAIgASgJMt4FCglTdG92ZXBpcGUSWwoEUGluZxInLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLlBpbmdSZXF1ZXN0GigudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuUGluZ1Jlc3BvbnNlIgASYQoGSW5nZXN0EikudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuSW5nZXN0UmVxdWVzdBoqLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkluZ2VzdFJlc3BvbnNlIgASjgEKFUdldFJlcXVlc3RIaXN0b3J5QnlJRBI4LnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFJlcXVlc3RIaXN0b3J5QnlJRFJlcXVlc3QaOS51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5HZXRSZXF1ZXN0SGlzdG9yeUJ5SURSZXNwb25zZSIAEpEBChZHZXRSZXF1ZXN0SGlzdG9yeUJ5VVJJEjkudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuR2V0UmVxdWVzdEhpc3RvcnlCeVVSSVJlcXVlc3QaOi51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5HZXRSZXF1ZXN0SGlzdG9yeUJ5VVJJUmVzcG9uc2UiABKOAQoVR2V0UHJvamVjdFN0YXR1c0J5VVJJEjgudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuR2V0UHJvamVjdFN0YXR1c0J5VVJJUmVxdWVzdBo5LnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFByb2plY3RTdGF0dXNCeVVSSVJlc3BvbnNlIgASWwoETGlzdBInLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkxpc3RSZXF1ZXN0GigudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuTGlzdFJlc3BvbnNlIgBCZQoeY29tLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlQg5TdG92ZXBpcGVQcm90b1ABWjFnaXRodWIuY29tL3ViZXIvc3VibWl0cXVldWUvYXBpL3N0b3ZlcGlwZS9wcm90b3BiYgZwcm90bzM");
+  fileDesc("CiNhcGkvc3RvdmVwaXBlL3Byb3RvL3N0b3ZlcGlwZS5wcm90bxIadWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUiHgoLUGluZ1JlcXVlc3QSDwoHbWVzc2FnZRgBIAEoCSJaCgxQaW5nUmVzcG9uc2USDwoHbWVzc2FnZRgBIAEoCRIUCgxzZXJ2aWNlX25hbWUYAiABKAkSEQoJdGltZXN0YW1wGAMgASgDEhAKCGhvc3RuYW1lGAQgASgJIh4KDUluZ2VzdFJlcXVlc3QSDQoFcXVldWUYASABKAkiHAoOSW5nZXN0UmVzcG9uc2USCgoCaWQYASABKAkiQQocR2V0UmVxdWVzdEhpc3RvcnlCeUlEUmVxdWVzdBINCgVxdWV1ZRgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJIjsKHUdldFJlcXVlc3RIaXN0b3J5QnlVUklSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEgsKA3VyaRgCIAEoCSKGAQoMSGlzdG9yeUV2ZW50EhAKCGV2ZW50X2lkGAEgASgJEhQKDHRpbWVzdGFtcF9tcxgCIAEoAxIXCg1yZXF1ZXN0X3N0YXRlGAMgASgJSAASDwoFZXZlbnQYBCABKAlIABIWCg5vdXRjb21lX3JlYXNvbhgFIAEoCUIMCgpvY2N1cnJlbmNlIqMBCg5SZXF1ZXN0SGlzdG9yeRISCgpyZXF1ZXN0X2lkGAEgASgJEjgKBmV2ZW50cxgCIAMoCzIoLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkhpc3RvcnlFdmVudBJDCg9yZXF1ZXN0X3N1bW1hcnkYAyABKAsyKi51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5SZXF1ZXN0U3VtbWFyeSKeAQodR2V0UmVxdWVzdEhpc3RvcnlCeUlEUmVzcG9uc2USOAoGZXZlbnRzGAEgAygLMigudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuSGlzdG9yeUV2ZW50EkMKD3JlcXVlc3Rfc3VtbWFyeRgCIAEoCzIqLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLlJlcXVlc3RTdW1tYXJ5Il8KHkdldFJlcXVlc3RIaXN0b3J5QnlVUklSZXNwb25zZRI9CgloaXN0b3JpZXMYASADKAsyKi51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5SZXF1ZXN0SGlzdG9yeSJ6ChxHZXRQcm9qZWN0U3RhdHVzQnlVUklSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEhIKCmNoYW5nZV91cmkYAiABKAkSEAoIcHJvamVjdHMYAyADKAkSEQoJcGFnZV9zaXplGAQgASgFEhIKCnBhZ2VfdG9rZW4YBSABKAkiSQoRUHJvamVjdFZhbGlkYXRpb24SDwoHcHJvamVjdBgBIAEoCRIZCg9icmVha2FnZV9kZWdyZWUYAiABKAFIAEIICgZyZXN1bHQizQIKHUdldFByb2plY3RTdGF0dXNCeVVSSVJlc3BvbnNlEhIKCnJlcXVlc3RfaWQYASABKAkSDQoFcXVldWUYAiABKAkSEgoKY2hhbmdlX3VyaRgDIAEoCRIQCghiYXNlX3VyaRgEIAEoCRIVCg1yZXF1ZXN0X3N0YXRlGAUgASgJEhUKDXVwZGF0ZWRfYXRfbXMYCiABKAMSJAoacmVwb3NpdG9yeV9icmVha2FnZV9kZWdyZWUYBiABKAFIABIgChhwcm9qZWN0X3Jlc3VsdHNfY29tcGxldGUYByABKAgSPwoIcHJvamVjdHMYCCADKAsyLS51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5Qcm9qZWN0VmFsaWRhdGlvbhIXCg9uZXh0X3BhZ2VfdG9rZW4YCSABKAlCEwoRcmVwb3NpdG9yeV9yZXN1bHQivQEKDlJlcXVlc3RTdW1tYXJ5EhIKCnJlcXVlc3RfaWQYASABKAkSDQoFcXVldWUYAiABKAkSEgoKY2hhbmdlX3VyaRgDIAEoCRIQCghiYXNlX3VyaRgEIAEoCRIVCg1yZXF1ZXN0X3N0YXRlGAUgASgJEhsKE3N0YXRlX3VwZGF0ZWRfYXRfbXMYBiABKAMSFgoOYWNjZXB0ZWRfYXRfbXMYByABKAMSFgoOb3V0Y29tZV9yZWFzb24YCCABKAkitAEKC0xpc3RSZXF1ZXN0Eg0KBXF1ZXVlGAEgASgJEiEKF2FjY2VwdGVkX2F0X29yX2FmdGVyX21zGAIgASgDSAASHAoSYWNjZXB0ZWRfYmVmb3JlX21zGAMgASgDSAESEQoJcGFnZV9zaXplGAQgASgFEhIKCnBhZ2VfdG9rZW4YBSABKAlCFgoUYWNjZXB0ZWRfbG93ZXJfYm91bmRCFgoUYWNjZXB0ZWRfdXBwZXJfYm91bmQiZQoMTGlzdFJlc3BvbnNlEjwKCHJlcXVlc3RzGAEgAygLMioudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuUmVxdWVzdFN1bW1hcnkSFwoPbmV4dF9wYWdlX3Rva2VuGAIgASgJIjoKFUdldFF1ZXVlU3RhdHVzUmVxdWVzdBINCgVxdWV1ZRgBIAEoCRISCgpjaGFuZ2VfdXJpGAIgASgJIp4BChVRdWV1ZUVuYWJsZW1lbnRTdGF0dXMSDwoHdmVyc2lvbhgBIAEoAxI6CgVzdGF0ZRgCIAEoDjIrLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLlF1ZXVlRW5hYmxlbWVudBIhChllZmZlY3RpdmVfZnJvbV9jb21taXRfdXJpGAMgASgJEhUKDWNoYW5nZWRfYXRfbXMYBCABKAMibgoWR2V0UXVldWVTdGF0dXNSZXNwb25zZRINCgVxdWV1ZRgBIAEoCRJFCgplbmFibGVtZW50GAIgASgLMjEudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuUXVldWVFbmFibGVtZW50U3RhdHVzKmwKD1F1ZXVlRW5hYmxlbWVudBIcChhRVUVVRV9FTkFCTEVNRU5UX1VOS05PV04QABIcChhRVUVVRV9FTkFCTEVNRU5UX0VOQUJMRUQQARIdChlRVUVVRV9FTkFCTEVNRU5UX0RJU0FCTEVEEAIy2QYKCVN0b3ZlcGlwZRJbCgRQaW5nEicudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuUGluZ1JlcXVlc3QaKC51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5QaW5nUmVzcG9uc2UiABJhCgZJbmdlc3QSKS51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5Jbmdlc3RSZXF1ZXN0GioudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuSW5nZXN0UmVzcG9uc2UiABKOAQoVR2V0UmVxdWVzdEhpc3RvcnlCeUlEEjgudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuR2V0UmVxdWVzdEhpc3RvcnlCeUlEUmVxdWVzdBo5LnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFJlcXVlc3RIaXN0b3J5QnlJRFJlc3BvbnNlIgASkQEKFkdldFJlcXVlc3RIaXN0b3J5QnlVUkkSOS51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5HZXRSZXF1ZXN0SGlzdG9yeUJ5VVJJUmVxdWVzdBo6LnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFJlcXVlc3RIaXN0b3J5QnlVUklSZXNwb25zZSIAEo4BChVHZXRQcm9qZWN0U3RhdHVzQnlVUkkSOC51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5HZXRQcm9qZWN0U3RhdHVzQnlVUklSZXF1ZXN0GjkudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuR2V0UHJvamVjdFN0YXR1c0J5VVJJUmVzcG9uc2UiABJbCgRMaXN0EicudWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGUuTGlzdFJlcXVlc3QaKC51YmVyLnN1Ym1pdHF1ZXVlLnN0b3ZlcGlwZS5MaXN0UmVzcG9uc2UiABJ5Cg5HZXRRdWV1ZVN0YXR1cxIxLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFF1ZXVlU3RhdHVzUmVxdWVzdBoyLnViZXIuc3VibWl0cXVldWUuc3RvdmVwaXBlLkdldFF1ZXVlU3RhdHVzUmVzcG9uc2UiAEJlCh5jb20udWJlci5zdWJtaXRxdWV1ZS5zdG92ZXBpcGVCDlN0b3ZlcGlwZVByb3RvUAFaMWdpdGh1Yi5jb20vdWJlci9zdWJtaXRxdWV1ZS9hcGkvc3RvdmVwaXBlL3Byb3RvcGJiBnByb3RvMw");
 
 /**
  * PingRequest is the request for the Ping method
@@ -665,6 +665,130 @@ export const ListResponseSchema: GenMessage<ListResponse> = /*@__PURE__*/
   messageDesc(file_api_stovepipe_proto_stovepipe, 15);
 
 /**
+ * @generated from message uber.submitqueue.stovepipe.GetQueueStatusRequest
+ */
+export type GetQueueStatusRequest = Message<"uber.submitqueue.stovepipe.GetQueueStatusRequest"> & {
+  /**
+   * Required stable repo-and-ref queue name.
+   *
+   * @generated from field: string queue = 1;
+   */
+  queue: string;
+
+  /**
+   * Optional immutable commit URI. Empty selects the latest materialized state.
+   *
+   * @generated from field: string change_uri = 2;
+   */
+  changeUri: string;
+};
+
+/**
+ * Describes the message uber.submitqueue.stovepipe.GetQueueStatusRequest.
+ * Use `create(GetQueueStatusRequestSchema)` to create a new message.
+ */
+export const GetQueueStatusRequestSchema: GenMessage<GetQueueStatusRequest> = /*@__PURE__*/
+  messageDesc(file_api_stovepipe_proto_stovepipe, 16);
+
+/**
+ * QueueEnablementStatus describes applied enablement.
+ *
+ * @generated from message uber.submitqueue.stovepipe.QueueEnablementStatus
+ */
+export type QueueEnablementStatus = Message<"uber.submitqueue.stovepipe.QueueEnablementStatus"> & {
+  /**
+   * Positive enablement sequence, increasing with each state change.
+   *
+   * @generated from field: int64 version = 1;
+   */
+  version: bigint;
+
+  /**
+   * Applied enablement. Successful lookups never return UNKNOWN.
+   *
+   * @generated from field: uber.submitqueue.stovepipe.QueueEnablement state = 2;
+   */
+  state: QueueEnablement;
+
+  /**
+   * Inclusive first covered commit. Empty only for initial DISABLED version 1.
+   *
+   * @generated from field: string effective_from_commit_uri = 3;
+   */
+  effectiveFromCommitUri: string;
+
+  /**
+   * Application timestamp in Unix milliseconds, not source-control commit time.
+   *
+   * @generated from field: int64 changed_at_ms = 4;
+   */
+  changedAtMs: bigint;
+};
+
+/**
+ * Describes the message uber.submitqueue.stovepipe.QueueEnablementStatus.
+ * Use `create(QueueEnablementStatusSchema)` to create a new message.
+ */
+export const QueueEnablementStatusSchema: GenMessage<QueueEnablementStatus> = /*@__PURE__*/
+  messageDesc(file_api_stovepipe_proto_stovepipe, 17);
+
+/**
+ * @generated from message uber.submitqueue.stovepipe.GetQueueStatusResponse
+ */
+export type GetQueueStatusResponse = Message<"uber.submitqueue.stovepipe.GetQueueStatusResponse"> & {
+  /**
+   * Queue selected by the request.
+   *
+   * @generated from field: string queue = 1;
+   */
+  queue: string;
+
+  /**
+   * Current enablement, or enablement covering change_uri. Always present on success.
+   *
+   * @generated from field: uber.submitqueue.stovepipe.QueueEnablementStatus enablement = 2;
+   */
+  enablement?: QueueEnablementStatus | undefined;
+};
+
+/**
+ * Describes the message uber.submitqueue.stovepipe.GetQueueStatusResponse.
+ * Use `create(GetQueueStatusResponseSchema)` to create a new message.
+ */
+export const GetQueueStatusResponseSchema: GenMessage<GetQueueStatusResponse> = /*@__PURE__*/
+  messageDesc(file_api_stovepipe_proto_stovepipe, 18);
+
+/**
+ * QueueEnablement is independent of validation results and execution controls.
+ *
+ * @generated from enum uber.submitqueue.stovepipe.QueueEnablement
+ */
+export enum QueueEnablement {
+  /**
+   * Unknown is never an explicit disablement.
+   *
+   * @generated from enum value: QUEUE_ENABLEMENT_UNKNOWN = 0;
+   */
+  UNKNOWN = 0,
+
+  /**
+   * @generated from enum value: QUEUE_ENABLEMENT_ENABLED = 1;
+   */
+  ENABLED = 1,
+
+  /**
+   * @generated from enum value: QUEUE_ENABLEMENT_DISABLED = 2;
+   */
+  DISABLED = 2,
+}
+
+/**
+ * Describes the enum uber.submitqueue.stovepipe.QueueEnablement.
+ */
+export const QueueEnablementSchema: GenEnum<QueueEnablement> = /*@__PURE__*/
+  enumDesc(file_api_stovepipe_proto_stovepipe, 0);
+
+/**
  * Stovepipe provides the Stovepipe API.
  *
  * @generated from service uber.submitqueue.stovepipe.Stovepipe
@@ -730,6 +854,16 @@ export const Stovepipe: GenService<{
     methodKind: "unary";
     input: typeof ListRequestSchema;
     output: typeof ListResponseSchema;
+  },
+  /**
+   * GetQueueStatus returns current enablement or enablement for a supplied commit.
+   *
+   * @generated from rpc uber.submitqueue.stovepipe.Stovepipe.GetQueueStatus
+   */
+  getQueueStatus: {
+    methodKind: "unary";
+    input: typeof GetQueueStatusRequestSchema;
+    output: typeof GetQueueStatusResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_api_stovepipe_proto_stovepipe, 0);
