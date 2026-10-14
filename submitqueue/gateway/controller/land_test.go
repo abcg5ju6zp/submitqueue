@@ -36,7 +36,8 @@ import (
 	"github.com/uber/submitqueue/submitqueue/entity"
 	"github.com/uber/submitqueue/submitqueue/extension/queueconfig"
 	qcmock "github.com/uber/submitqueue/submitqueue/extension/queueconfig/mock"
-	queuepausemock "github.com/uber/submitqueue/submitqueue/extension/queuepause/mock"
+	"github.com/uber/submitqueue/submitqueue/extension/queuepause"
+	queuepausefake "github.com/uber/submitqueue/submitqueue/extension/queuepause/fake"
 	queuepausenoop "github.com/uber/submitqueue/submitqueue/extension/queuepause/noop"
 	storagemock "github.com/uber/submitqueue/submitqueue/extension/storage/mock"
 	requestcore "github.com/uber/submitqueue/submitqueue/gateway/core/request"
@@ -343,7 +344,7 @@ func TestLand_PropagatesQueueConfigStoreError(t *testing.T) {
 	assert.False(t, IsInvalidRequest(err))
 }
 
-func newLandControllerWithPauseStore(t *testing.T, ctrl *gomock.Controller, cnt counter.Counter, qcs *qcmock.MockStore, pauses *queuepausemock.MockStore) LandController {
+func newLandControllerWithPauseStore(t *testing.T, ctrl *gomock.Controller, cnt counter.Counter, qcs *qcmock.MockStore, pauses queuepause.Store) LandController {
 	fixture := newControllerStorageFixture(ctrl)
 	return NewLandController(zap.NewNop().Sugar(), tally.NoopScope, staticCounterFactory{counter: cnt}, fixture.newFactory(ctrl), fixture.newMaterializer(ctrl), qcs, pauses, newTestRegistryWithNoopPublisher(t, ctrl))
 }
@@ -366,8 +367,7 @@ func TestLand_QueuePause(t *testing.T) {
 			if tt.wantLanded {
 				cnt.EXPECT().Next(gomock.Any(), gomock.Any()).Return(int64(1), nil)
 			}
-			pauses := queuepausemock.NewMockStore(ctrl)
-			pauses.EXPECT().Get(gomock.Any(), "test-queue").Return(tt.state, nil)
+			pauses := queuepausefake.New().Set("test-queue", tt.state)
 			controller := newLandControllerWithPauseStore(t, ctrl, cnt, noopQueueConfigStore(ctrl), pauses)
 
 			result, err := controller.Land(context.Background(), testLandRequest("test-queue"))
@@ -391,8 +391,7 @@ func TestLand_QueuePause(t *testing.T) {
 func TestLand_FailsClosedWhenPauseStoreErrors(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	cnt := countermock.NewMockCounter(ctrl)
-	pauses := queuepausemock.NewMockStore(ctrl)
-	pauses.EXPECT().Get(gomock.Any(), "test-queue").Return(entity.QueuePause{}, fmt.Errorf("pause backend down"))
+	pauses := queuepausefake.New().FailWith(fmt.Errorf("pause backend down"))
 	controller := newLandControllerWithPauseStore(t, ctrl, cnt, noopQueueConfigStore(ctrl), pauses)
 
 	_, err := controller.Land(context.Background(), testLandRequest("test-queue"))
@@ -407,7 +406,7 @@ func TestLand_ReportsUnrecognizedQueueBeforeReadingPauseState(t *testing.T) {
 	cnt := countermock.NewMockCounter(ctrl)
 	qcs := qcmock.NewMockStore(ctrl)
 	qcs.EXPECT().Get(gomock.Any(), "missing-queue").Return(entity.QueueConfig{}, queueconfig.ErrNotFound)
-	pauses := queuepausemock.NewMockStore(ctrl)
+	pauses := queuepausefake.New().FailWith(fmt.Errorf("pause backend down"))
 	controller := newLandControllerWithPauseStore(t, ctrl, cnt, qcs, pauses)
 
 	_, err := controller.Land(context.Background(), testLandRequest("missing-queue"))
