@@ -15,6 +15,8 @@ The store only reports state. The gateway and orchestrator enforce it, so every 
 - `noop` never pauses a queue. It is the default when no pause state is configured.
 - `file` reads a YAML file listing the queues that have switches set, and re-reads it on every `Get`, so editing the file pauses or unpauses a queue without a restart. The file must exist and parse when the store is constructed, so a mistyped path fails at startup. A later read or parse failure is returned as an error and never treated as not paused. Unknown fields are rejected so a misspelled switch cannot silently leave a queue unpaused.
 
+- `fake` is an in-memory store for tests. A test sets a queue's state, changes it while consumers run, and can make every read fail. It is never used in production.
+
 A deployer can supply its own implementation backed by a config service.
 
 ## Entities
