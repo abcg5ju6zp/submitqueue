@@ -348,16 +348,16 @@ func newLandControllerWithPauseStore(t *testing.T, ctrl *gomock.Controller, cnt 
 	return NewLandController(zap.NewNop().Sugar(), tally.NoopScope, staticCounterFactory{counter: cnt}, fixture.newFactory(ctrl), fixture.newMaterializer(ctrl), qcs, pauses, newTestRegistryWithNoopPublisher(t, ctrl))
 }
 
-func TestLand_QueuePauseState(t *testing.T) {
+func TestLand_QueuePause(t *testing.T) {
 	tests := []struct {
 		name       string
-		state      entity.QueuePauseState
+		state      entity.QueuePause
 		wantLanded bool
 	}{
-		{name: "not paused", state: entity.QueuePauseState{}, wantLanded: true},
-		{name: "freeze only still accepts lands", state: entity.QueuePauseState{FreezeProcessing: true}, wantLanded: true},
-		{name: "reject only", state: entity.QueuePauseState{RejectLands: true}, wantLanded: false},
-		{name: "reject and freeze", state: entity.QueuePauseState{RejectLands: true, FreezeProcessing: true}, wantLanded: false},
+		{name: "not paused", state: entity.QueuePause{}, wantLanded: true},
+		{name: "freeze only still accepts lands", state: entity.QueuePause{FreezeProcessing: true}, wantLanded: true},
+		{name: "reject only", state: entity.QueuePause{RejectLands: true}, wantLanded: false},
+		{name: "reject and freeze", state: entity.QueuePause{RejectLands: true, FreezeProcessing: true}, wantLanded: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -392,7 +392,7 @@ func TestLand_FailsClosedWhenPauseStoreErrors(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	cnt := countermock.NewMockCounter(ctrl)
 	pauses := queuepausemock.NewMockStore(ctrl)
-	pauses.EXPECT().Get(gomock.Any(), "test-queue").Return(entity.QueuePauseState{}, fmt.Errorf("pause backend down"))
+	pauses.EXPECT().Get(gomock.Any(), "test-queue").Return(entity.QueuePause{}, fmt.Errorf("pause backend down"))
 	controller := newLandControllerWithPauseStore(t, ctrl, cnt, noopQueueConfigStore(ctrl), pauses)
 
 	_, err := controller.Land(context.Background(), testLandRequest("test-queue"))
