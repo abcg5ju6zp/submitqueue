@@ -67,11 +67,17 @@ func IsUnrecognizedQueue(err error) bool {
 // QueuePausedError indicates the queue is refusing new land requests.
 type QueuePausedError struct {
 	Queue string
+	// Reason is the operator's explanation for the pause, empty when none was given.
+	Reason string
 }
 
 // Error implements the error interface.
 func (e *QueuePausedError) Error() string {
-	return fmt.Sprintf("queue %q is paused and not accepting land requests", e.Queue)
+	msg := fmt.Sprintf("queue %q is paused and not accepting land requests", e.Queue)
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	return msg
 }
 
 // IsQueuePaused returns true if any error in the chain is a *QueuePausedError.
@@ -146,7 +152,7 @@ func (c *landController) Land(ctx context.Context, req entity.LandRequest) (resu
 		return entity.LandResult{}, fmt.Errorf("failed to read pause state for queue=%s: %w", queue, err)
 	}
 	if pauseState.RejectLands {
-		return entity.LandResult{}, errs.NewUserError(&QueuePausedError{Queue: queue})
+		return entity.LandResult{}, errs.NewUserError(&QueuePausedError{Queue: queue, Reason: pauseState.Reason})
 	}
 
 	// Generate a queue-scoped request ID for the land request.

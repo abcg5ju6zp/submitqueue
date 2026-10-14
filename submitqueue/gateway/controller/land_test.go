@@ -354,11 +354,14 @@ func TestLand_QueuePause(t *testing.T) {
 		name       string
 		state      entity.QueuePause
 		wantLanded bool
+		wantReason string
 	}{
 		{name: "not paused", state: entity.QueuePause{}, wantLanded: true},
 		{name: "freeze only still accepts lands", state: entity.QueuePause{FreezeProcessing: true}, wantLanded: true},
 		{name: "reject only", state: entity.QueuePause{RejectLands: true}, wantLanded: false},
 		{name: "reject and freeze", state: entity.QueuePause{RejectLands: true, FreezeProcessing: true}, wantLanded: false},
+		{name: "reject carries the reason", state: entity.QueuePause{RejectLands: true, Reason: "repo freeze until 17:00"}, wantLanded: false, wantReason: "repo freeze until 17:00"},
+		{name: "reason alone does not reject", state: entity.QueuePause{Reason: "stale note"}, wantLanded: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -384,6 +387,7 @@ func TestLand_QueuePause(t *testing.T) {
 			var typed *QueuePausedError
 			require.ErrorAs(t, err, &typed)
 			assert.Equal(t, "test-queue", typed.Queue)
+			assert.Equal(t, tt.wantReason, typed.Reason)
 		})
 	}
 }
