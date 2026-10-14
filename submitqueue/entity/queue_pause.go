@@ -14,10 +14,10 @@
 
 package entity
 
-// QueuePauseState is a point-in-time snapshot of the pause switches of a single
+// QueuePause is a point-in-time snapshot of the pause switches of a single
 // queue. The two switches are independent, and the zero value means the queue
 // is not paused.
-type QueuePauseState struct {
+type QueuePause struct {
 	// RejectLands is true while the queue refuses new land requests.
 	RejectLands bool
 

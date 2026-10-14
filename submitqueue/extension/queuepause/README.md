@@ -12,4 +12,4 @@ The store only reports state. The gateway and orchestrator enforce it, so every 
 
 ## Entities
 
-`QueuePauseState` lives in `submitqueue/entity/queue_pause_state.go`.
+`QueuePause` lives in `submitqueue/entity/queue_pause.go`.

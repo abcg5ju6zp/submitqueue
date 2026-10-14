@@ -30,5 +30,5 @@ type Store interface {
 	// the backend could not be read, not that the queue is unpaused; a caller
 	// that enforces a switch must not fail open on it. Implementations must be
 	// safe for concurrent use.
-	Get(ctx context.Context, queue string) (entity.QueuePauseState, error)
+	Get(ctx context.Context, queue string) (entity.QueuePause, error)
 }

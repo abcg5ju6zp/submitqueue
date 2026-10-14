@@ -42,10 +42,10 @@ func (m *MockStore) EXPECT() *MockStoreMockRecorder {
 }
 
 // Get mocks base method.
-func (m *MockStore) Get(ctx context.Context, queue string) (entity.QueuePauseState, error) {
+func (m *MockStore) Get(ctx context.Context, queue string) (entity.QueuePause, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Get", ctx, queue)
-	ret0, _ := ret[0].(entity.QueuePauseState)
+	ret0, _ := ret[0].(entity.QueuePause)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
