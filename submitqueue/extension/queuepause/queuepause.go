@@ -27,7 +27,8 @@ import (
 type Store interface {
 	// Get returns the current pause state of a queue. A queue with no entry
 	// returns the zero state (not paused) and no error. A non-nil error means
-	// the backend could not be read, never that the queue is unpaused.
-	// Implementations must be safe for concurrent use.
+	// the backend could not be read, not that the queue is unpaused; what to
+	// enforce in that case is the caller's decision. Implementations must be
+	// safe for concurrent use.
 	Get(ctx context.Context, queue string) (entity.QueuePauseState, error)
 }
