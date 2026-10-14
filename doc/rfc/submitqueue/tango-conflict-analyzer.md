@@ -213,7 +213,7 @@ The analysis can fail in these ways:
 - The change type is `INVALID`.
 - Tango returns any other error or times out.
 
-Any of these fails the analysis, and a failure never becomes "no conflicts", because dropping a target would hide a conflict. A queue-configured fallback to `all` is a possible later option.
+Any of these fails the analysis. The analyzer fails closed, and any fallback belongs outside SubmitQueue.
 
 ## Algorithm
 
