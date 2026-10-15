@@ -2,9 +2,19 @@
 
 ## Queue-leading primary keys
 
-Every table leads its primary key with `queue`: `request` and `batch` on `(queue, id)`, `build` on `(queue, id)`, `batch_dependent` on `(queue, batch_id)`, `request_batch` on `(queue, request_id, batch_id)`, `change` on `(queue, uri, request_id)`, `queue_batch_state` on `(queue, state, batch_id)`, and `speculation_path_set` on `(queue, head)`. A queue-bound store instance prefixes every read and stamps every write with its bound queue, so one queue's rows are unreachable through another queue's binding and every table is shardable by queue. `//tool/linter/queueshard` enforces this, and also rejects any secondary index that does not itself lead with `queue`, since such an index would reintroduce a cross-queue access path.
+Every table leads its primary key with `queue`: `request` and `batch` on `(queue, id)`, `build` on `(queue, id)`, `batch_dependent` on `(queue, batch_id)`, `request_batch` on `(queue, request_id, batch_id)`, `change` on `(queue, uri, request_id)`, `queue_batch_state` on `(queue, state, batch_id)`, `speculation_path_set` on `(queue, head)`, and `speculation_receipt` on `(queue, head, stage, token)`. A queue-bound store instance prefixes every read and stamps every write with its bound queue, so one queue's rows are unreachable through another queue's binding and every table is shardable by queue. `//tool/linter/queueshard` enforces this, and also rejects any secondary index that does not itself lead with `queue`, since such an index would reintroduce a cross-queue access path.
 
 The `build` key also removes a cross-queue uniqueness assumption: build IDs are runner-minted, so two queues sharing one CI pipeline may legitimately mint the same identifier. `speculation_path_set` relies on the same property for its head: a batch ID is unique only within its queue.
+
+## speculation_receipt table
+
+### Composite primary key: `(queue, head, stage, token)`
+
+`speculation_receipt` holds the immutable action receipts of a head's conditional speculation stages. A row is created once when a stage commits (the first stages are the land hand-off, keyed by the batch version the Landing transition committed at, and a started build's signal hand-off, keyed by the build ID) and carries the exact `message_id` recovery must republish under. There are no updates: replay is a point read by the full key followed by a publish, so restart, redelivery, and dead-letter recovery resume a stage instead of enacting it twice. `message_id` is stored rather than derived so recovery replays the original wire identity even across code changes.
+
+## speculation_path_set.winner_path_id
+
+`speculation_path_set` additionally carries `winner_path_id`: the winner-selection stage, written in the same version as a land decision's sibling supersede and cleared when the batch's compare-and-swap loses to a cancellation. It is empty for every waiting, failing, or cancelling head.
 
 Because the queue is part of every key, the request identifier alone no longer addresses a row — the read APIs take the queue alongside the sqid or change URI, and the stores are resolved per queue through `storage.Factory`. No identifier is parsed to recover a queue.
 

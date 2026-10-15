@@ -32,6 +32,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	orchstorage "github.com/uber/submitqueue/submitqueue/orchestrator/extension/storage"
 
@@ -45,6 +46,7 @@ import (
 	"github.com/uber/submitqueue/submitqueue/entity"
 	"github.com/uber/submitqueue/submitqueue/extension/buildrunner"
 	"github.com/uber/submitqueue/submitqueue/extension/storage"
+	corereceipt "github.com/uber/submitqueue/submitqueue/orchestrator/core/receipt"
 	"go.uber.org/zap"
 )
 
@@ -97,10 +99,12 @@ func NewController(
 // started, and that goes in records of its own.
 //
 // A failure partway through nacks the whole message and redelivery re-runs all
-// of it: starts are made idempotent by the link record each one writes (see
-// startPath), and a redelivery additionally re-publishes the signal for any
-// live path already linked to a build, in case the crashed attempt died
-// between the link and the signal (see ensureSignal).
+// of it as conditional stages: a start is skipped when the link record already
+// confirms the build, and the hand-off to buildsignal is resumed from its
+// stage receipt for any live path already linked to a build, so a delivery
+// that crashed between the link and the signal — or between the signal's
+// receipt and its publish — re-publishes under the original message identity
+// instead of forking a second poll chain (see ensureSignal).
 func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) error {
 	msg := delivery.Message()
 
@@ -160,15 +164,6 @@ func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) er
 	// the poll loop, which reads the batch state on every poll.
 	halted := entity.IsBatchStateHalted(batch.State)
 
-	// Attempt here is the queue's redelivery counter for this message — how
-	// many times it has been handed out without being acked — and has nothing
-	// to do with a path's build attempt. A value above 1 means an earlier
-	// processing of this same message died part-way (nacked or crashed), and
-	// only then can a linked build be missing its signal — a first delivery
-	// has not published any — so only then is the repair worth the republishes
-	// it would otherwise scatter (see ensureSignal).
-	recovering := delivery.Attempt() > 1
-
 	for _, entry := range set.Paths {
 		if entry.Status.IsTerminal() {
 			continue
@@ -185,10 +180,14 @@ func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) er
 			metrics.NamedCounter(c.metricsScope, opName, "skipped_halted", 1)
 		}
 
-		if recovering {
-			if err := c.ensureSignal(ctx, store, batch, entry); err != nil {
-				return err
-			}
+		// Every live entry startPath did not just handle — one observed
+		// building or cancelling, or pending on a halted batch — already names
+		// a build through its link. The signal is a conditional stage: its
+		// receipt makes the hand-off idempotent on every delivery, not just a
+		// redelivery, so a first attempt that died between the link and the
+		// receipt is repaired too.
+		if err := c.ensureSignal(ctx, store, batch, entry); err != nil {
+			return err
 		}
 	}
 
@@ -224,9 +223,9 @@ func (c *Controller) startPath(ctx context.Context, store orchstorage.Storage, b
 	switch {
 	case err == nil:
 		// Already dispatched and named; all that can be missing is the signal,
-		// and a re-publish is deduped by the queue when it is not.
+		// and a re-publish reuses its receipt and message identity.
 		metrics.NamedCounter(c.metricsScope, opName, "already_dispatched", 1)
-		return c.publishBuildSignal(ctx, existing.BuildID, batch.Queue)
+		return c.publishBuildSignal(ctx, store, batch, existing.BuildID)
 	case !errors.Is(err, storage.ErrNotFound):
 		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
 		return fmt.Errorf("failed to look up build for path %s attempt %d: %w", entry.ID, entry.Attempt, err)
@@ -284,7 +283,7 @@ func (c *Controller) startPath(ctx context.Context, store orchstorage.Storage, b
 				"attempt", entry.Attempt,
 				"surplus_build_id", buildID.ID,
 			)
-			if err := c.publishBuildSignal(ctx, buildID.ID, batch.Queue); err != nil {
+			if err := c.publishBuildSignal(ctx, store, batch, buildID.ID); err != nil {
 				return err
 			}
 			winner, err := store.GetPathBuildStore().Get(ctx, entry.ID, entry.Attempt)
@@ -292,7 +291,7 @@ func (c *Controller) startPath(ctx context.Context, store orchstorage.Storage, b
 				metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
 				return fmt.Errorf("failed to look up the winning build for path %s attempt %d: %w", entry.ID, entry.Attempt, err)
 			}
-			return c.publishBuildSignal(ctx, winner.BuildID, batch.Queue)
+			return c.publishBuildSignal(ctx, store, batch, winner.BuildID)
 		}
 		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
 		return fmt.Errorf("failed to link path %s attempt %d to build %s: %w", entry.ID, entry.Attempt, buildID.ID, err)
@@ -307,29 +306,27 @@ func (c *Controller) startPath(ctx context.Context, store orchstorage.Storage, b
 		"base_size", len(base),
 	)
 
-	return c.publishBuildSignal(ctx, buildID.ID, batch.Queue)
+	return c.publishBuildSignal(ctx, store, batch, buildID.ID)
 }
 
-// ensureSignal re-publishes the build signal for a live path whose build is
-// already linked. Called only on redeliveries.
+// ensureSignal drives the conditional build-signal stage for a live entry
+// this delivery did not just start: one observed building or cancelling, or
+// pending on a halted batch. It runs on every delivery rather than on
+// redeliveries only.
 //
 // It closes the one crack in the "every linked build gets a signal" invariant:
 // a dispatch that dies between writing the link and publishing the signal
-// leaves a build no poll chain will ever watch. The message it was processing
-// was never acked, so it comes back — but by then the entry may have moved on
-// to building (an observation found the link) or cancelling (the run called it
-// off), or its batch may have halted: states no start would touch. Without
-// this, such a build runs unobserved forever and its path never settles.
+// leaves a build no poll chain will ever watch. The link is the stage's
+// generation key; the SpeculationReceipt is its confirmation: written before
+// the publish and carrying the signal's message ID, so a restart or a
+// dead-letter republish on a brand-new delivery still resumes here instead of
+// depending on the queue's redelivery counter or deduplication window.
 //
-// The republish uses the build ID as the message ID, so it dedups against the
-// original signal whenever that signal was actually sent. The dedup horizon is
-// the queue's GC of consumed rows, which is why this runs only on redelivery:
-// scattered over every ordinary dispatch, late republishes would now and then
-// slip past dedup and fork a second, redundant poll chain for a healthy build.
+// An absent link is normal: nothing was dispatched for the attempt yet (for
+// example a pending path on a halted batch), so there is no build to watch.
 func (c *Controller) ensureSignal(ctx context.Context, store orchstorage.Storage, batch entity.Batch, entry entity.SpeculationPathEntry) error {
 	link, err := store.GetPathBuildStore().Get(ctx, entry.ID, entry.Attempt)
 	if errors.Is(err, storage.ErrNotFound) {
-		// Nothing was dispatched for this attempt; there is no build to watch.
 		return nil
 	}
 	if err != nil {
@@ -338,13 +335,13 @@ func (c *Controller) ensureSignal(ctx context.Context, store orchstorage.Storage
 	}
 
 	metrics.NamedCounter(c.metricsScope, opName, "signal_ensured", 1)
-	c.logger.Debugw("re-published build signal on redelivery",
+	c.logger.Debugw("ensured build signal from stage receipt",
 		"batch_id", batch.ID,
 		"path_id", entry.ID,
 		"attempt", entry.Attempt,
 		"build_id", link.BuildID,
 	)
-	return c.publishBuildSignal(ctx, link.BuildID, batch.Queue)
+	return c.publishBuildSignal(ctx, store, batch, link.BuildID)
 }
 
 // loadBase loads the batches the path is stacked on top of.
@@ -370,7 +367,8 @@ func (c *Controller) loadBase(ctx context.Context, store orchstorage.Storage, pa
 	return base, nil
 }
 
-// publishBuildSignal hands a build off to the poll loop.
+// publishBuildSignal hands a build off to the poll loop under its stage
+// receipt.
 //
 // Only the runner's build ID travels, and it is also the partition key: the
 // poll loop writes nothing but that build's own record, so there is nothing to
@@ -378,19 +376,26 @@ func (c *Controller) loadBase(ctx context.Context, store orchstorage.Storage, pa
 // because they share the key. Partitioning by batch instead would put every
 // path of a head behind whichever of its builds polls slowest.
 //
-// The build ID is the message ID too, with no cause: a build is handed off
-// once in its life, so a repeat hand-off for the same build is meant to dedup
-// away while the original signal is still in the queue's un-GC'd window (see
-// publish.IntentID).
-func (c *Controller) publishBuildSignal(ctx context.Context, buildID, queue string) error {
-	payload, err := sqmq.MarshalID(sqmq.TopicKeyBuildSignal, buildID, queue)
+// The receipt is persisted before the publish: the build ID is both its token
+// and the message's partition key, and the message ID is the same
+// IntentID(buildID) a build has always been handed off under, so a recovery —
+// redelivery, restart, or a dead-letter republish — replays the hand-off as
+// the original message rather than forking a second poll chain, even after the
+// queue has garbage-collected the first row.
+func (c *Controller) publishBuildSignal(ctx context.Context, store orchstorage.Storage, batch entity.Batch, buildID string) error {
+	receipt, err := c.ensureSignalReceipt(ctx, store, batch, buildID)
+	if err != nil {
+		return err
+	}
+
+	payload, err := sqmq.MarshalID(sqmq.TopicKeyBuildSignal, buildID, batch.Queue)
 	if err != nil {
 		return fmt.Errorf("failed to serialize build ID: %w", err)
 	}
 
 	if err := publish.Message(ctx, c.registry, topickey.TopicKeyBuildSignal, publish.MessageParams{
-		Tenant:       queue,
-		ID:           publish.IntentID(buildID),
+		Tenant:       batch.Queue,
+		ID:           receipt.MessageID,
 		Payload:      payload,
 		PartitionKey: buildID,
 	}); err != nil {
@@ -398,6 +403,32 @@ func (c *Controller) publishBuildSignal(ctx context.Context, buildID, queue stri
 		return fmt.Errorf("failed to publish to buildsignal: %w", err)
 	}
 	return nil
+}
+
+// ensureSignalReceipt returns the build-signal receipt for one build, creating
+// it on the first hand-off. The build ID is both the generation token and the
+// message identity, so every replay of this stage for the same build converges
+// on one record and one wire message.
+func (c *Controller) ensureSignalReceipt(ctx context.Context, store orchstorage.Storage, batch entity.Batch, buildID string) (entity.SpeculationReceipt, error) {
+	want := entity.SpeculationReceipt{
+		Queue:       batch.Queue,
+		Head:        batch.ID,
+		Stage:       entity.SpeculationStageBuildSignal,
+		Token:       buildID,
+		MessageID:   publish.IntentID(buildID),
+		CreatedAtMs: time.Now().UnixMilli(),
+	}
+	got, created, err := corereceipt.Ensure(ctx, store.GetSpeculationReceiptStore(), want)
+	if err != nil {
+		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
+		return entity.SpeculationReceipt{}, fmt.Errorf("failed to ensure build signal receipt for build %s: %w", buildID, err)
+	}
+	if created {
+		metrics.NamedCounter(c.metricsScope, opName, "build_signal_receipt_created", 1)
+	} else {
+		metrics.NamedCounter(c.metricsScope, opName, "build_signal_receipt_reused", 1)
+	}
+	return got, nil
 }
 
 // Name returns the controller name for logging and metrics.

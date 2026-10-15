@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "每个 Batch 的推测运行和路径使用稳定代际，重复消息不会创建第二套 Build 或路径集合。"
+  - id: 2
+    type: f2p
+    text: "build signal 的丢失、重复或迟到结果不会覆盖新的 Batch 版本。"
+  - id: 3
+    type: f2p
+    text: "取消、依赖失效和通过路径并发时，只有一个决定获得终态提交权。"
+  - id: 4
+    type: f2p
+    text: "路径集合与 Batch 状态按条件版本提交，任一存储失败后只重做未确认阶段。"
+  - id: 5
+    type: f2p
+    text: "winner 确认后只发布一个稳定身份的 land 消息，响应不确定时恢复同一消息而非再选 winner。"
+  - id: 6
+    type: f2p
+    text: "控制器重启或 DLQ 恢复从持久路径、Build 和动作收据继续，不重复启动外部工作。"
+  - id: 7
+    type: f2p
+    text: "旧推测运行的迟到取消或成功结果不能改变后来重新处理的 Batch。"
+  - id: 8
+    type: p2p
+    text: "无推测、明确构建失败、正常单路径落地和 bypass 保持兼容。"

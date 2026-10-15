@@ -70,4 +70,7 @@ type Storage interface {
 
 	// GetPathBuildStore returns the PathBuildStore instance.
 	GetPathBuildStore() basestorage.PathBuildStore
+
+	// GetSpeculationReceiptStore returns the SpeculationReceiptStore instance.
+	GetSpeculationReceiptStore() basestorage.SpeculationReceiptStore
 }

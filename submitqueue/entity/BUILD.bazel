@@ -23,6 +23,7 @@ go_library(
         "request_receipt.go",
         "request_summary.go",
         "speculation.go",
+        "speculation_receipt.go",
         "subject.go",
     ],
     importpath = "github.com/uber/submitqueue/submitqueue/entity",

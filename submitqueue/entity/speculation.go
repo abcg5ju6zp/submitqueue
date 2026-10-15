@@ -151,10 +151,12 @@ type SpeculationPathEntry struct {
 	Path SpeculationPath
 	// Status is the lifecycle status of the current build attempt.
 	Status SpeculationPathStatus
-	// Attempt is the build attempt number for this path, starting at 1. A path
-	// can be built more than once (e.g. after a prior build is cancelled to free
-	// budget, or fails and is retried), so ID alone does not identify an
-	// execution — (ID, Attempt) does. It increments with each new build.
+	// Attempt is the path's stable run generation, starting at 1. Together with
+	// ID it identifies one build execution — (ID, Attempt) is what the build
+	// link, the poll chain, and every stage receipt are correlated by, so a
+	// redelivery or an old signal can never act on a different generation. A
+	// path can be built more than once (e.g. after a prior build is cancelled
+	// to free budget, or fails and is retried); each new build increments it.
 	Attempt int
 	// Version is the version of the object. It is used for optimistic locking.
 	// Versioning starts at 1 and is incremented for each change to the object.
@@ -179,6 +181,13 @@ type SpeculationPathSet struct {
 	Head string
 	// Paths is the head's chosen paths, live and recently finished.
 	Paths []SpeculationPathEntry
+	// WinnerPathID records the winner-selection stage: the path a land decision
+	// chose, written in the same set version that supersedes its siblings. It
+	// is non-empty only while the decision it belongs to owns the batch — set
+	// once the batch's compare-and-swap into Landing wins and cleared if that
+	// write loses to a cancellation. Empty on every head that is waiting,
+	// failing, or being cancelled.
+	WinnerPathID string
 	// Version is the version of the object. It is used for optimistic locking.
 	// Versioning starts at 1 and is incremented for each change to the object.
 	Version int32

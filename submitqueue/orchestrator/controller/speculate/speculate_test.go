@@ -132,6 +132,10 @@ func newProcHarness(t *testing.T, ctrl *gomock.Controller, publishErr error) *pr
 	h.pathSets = storagemock.NewMockSpeculationPathSetStore(ctrl)
 	h.pathBuilds = storagemock.NewMockPathBuildStore(ctrl)
 	h.builds = storagemock.NewMockBuildStore(ctrl)
+	receipts := storagemock.NewMockSpeculationReceiptStore(ctrl)
+	receipts.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(entity.SpeculationReceipt{}, storage.ErrNotFound).AnyTimes()
+	receipts.EXPECT().Create(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 
 	store := orchstoragemock.NewMockStorage(ctrl)
 	store.EXPECT().GetBatchStore().Return(h.batches).AnyTimes()
@@ -139,6 +143,7 @@ func newProcHarness(t *testing.T, ctrl *gomock.Controller, publishErr error) *pr
 	store.EXPECT().GetSpeculationPathSetStore().Return(h.pathSets).AnyTimes()
 	store.EXPECT().GetPathBuildStore().Return(h.pathBuilds).AnyTimes()
 	store.EXPECT().GetBuildStore().Return(h.builds).AnyTimes()
+	store.EXPECT().GetSpeculationReceiptStore().Return(receipts).AnyTimes()
 
 	pub := queuemock.NewMockPublisher(ctrl)
 	pub.EXPECT().Publish(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(

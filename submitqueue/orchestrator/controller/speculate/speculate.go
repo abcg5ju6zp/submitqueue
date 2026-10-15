@@ -143,10 +143,12 @@ func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) er
 	}
 
 	// A Landing batch has left the set finalize walks, so a message naming it
-	// is the only thing that will look at it again.
+	// is the only thing that will look at it again. The land receipt is the
+	// resumption point: a dispatch that committed but whose publish was lost
+	// is replayed under its original message identity.
 	if batch.State == entity.BatchStateLanding {
 		metrics.NamedCounter(c.metricsScope, opName, "self_heal_landing", 1)
-		if err := c.dispatchLand(ctx, batch); err != nil {
+		if err := c.dispatchLand(ctx, store, batch); err != nil {
 			return c.attributed(err, entity.BatchSubject(batch.ID))
 		}
 	}

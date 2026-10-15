@@ -107,8 +107,12 @@ type testDeps struct {
 	pathSets   *storagemock.MockSpeculationPathSetStore
 	builds     *storagemock.MockBuildStore
 	pathBuilds *storagemock.MockPathBuildStore
-	runner     *buildrunnermock.MockBuildRunner
-	publisher  *queuemock.MockPublisher
+	receipts       *storagemock.MockSpeculationReceiptStore
+	seededReceipts map[string]entity.SpeculationReceipt
+	createdReceipt *[]entity.SpeculationReceipt
+	receiptOps     *[]string
+	runner         *buildrunnermock.MockBuildRunner
+	publisher      *queuemock.MockPublisher
 }
 
 // newTestController wires a controller over fresh mocks. The batch store answers
@@ -126,12 +130,36 @@ func newTestController(t *testing.T, ctrl *gomock.Controller, batch entity.Batch
 	pathSets := storagemock.NewMockSpeculationPathSetStore(ctrl)
 	builds := storagemock.NewMockBuildStore(ctrl)
 	pathBuilds := storagemock.NewMockPathBuildStore(ctrl)
+	receipts := storagemock.NewMockSpeculationReceiptStore(ctrl)
+
+	// Signals are receipted on every delivery. One Get and Create expectation
+	// back the stage: seededReceipts holds the receipts a test wants found
+	// (keyed head/stage/token), everything else reads absent; created receipts
+	// and the order of writes are recorded for assertions. One expectation
+	// each keeps gomock's matching unambiguous.
+	seededReceipts := map[string]entity.SpeculationReceipt{}
+	createdReceipts := make([]entity.SpeculationReceipt, 0)
+	receiptOps := make([]string, 0)
+	receipts.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, head string, stage entity.SpeculationReceiptStage, token string) (entity.SpeculationReceipt, error) {
+			if r, ok := seededReceipts[head+"/"+string(stage)+"/"+token]; ok {
+				return r, nil
+			}
+			return entity.SpeculationReceipt{}, storage.ErrNotFound
+		}).AnyTimes()
+	receipts.EXPECT().Create(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, r entity.SpeculationReceipt) error {
+			createdReceipts = append(createdReceipts, r)
+			receiptOps = append(receiptOps, "create:"+string(r.Stage)+":"+r.Token)
+			return nil
+		}).AnyTimes()
 
 	store := orchstoragemock.NewMockStorage(ctrl)
 	store.EXPECT().GetBatchStore().Return(batches).AnyTimes()
 	store.EXPECT().GetSpeculationPathSetStore().Return(pathSets).AnyTimes()
 	store.EXPECT().GetBuildStore().Return(builds).AnyTimes()
 	store.EXPECT().GetPathBuildStore().Return(pathBuilds).AnyTimes()
+	store.EXPECT().GetSpeculationReceiptStore().Return(receipts).AnyTimes()
 
 	publisher := queuemock.NewMockPublisher(ctrl)
 	q := queuemock.NewMockQueue(ctrl)
@@ -151,8 +179,11 @@ func newTestController(t *testing.T, ctrl *gomock.Controller, batch entity.Batch
 
 	return controller, &testDeps{
 		store: store, batches: batches, pathSets: pathSets,
-		builds: builds, pathBuilds: pathBuilds,
-		runner: runner, publisher: publisher,
+		builds: builds, pathBuilds: pathBuilds, receipts: receipts,
+		seededReceipts: seededReceipts,
+		createdReceipt: &createdReceipts,
+		receiptOps:     &receiptOps,
+		runner:         runner, publisher: publisher,
 	}
 }
 
@@ -185,7 +216,8 @@ func process(t *testing.T, ctrl *gomock.Controller, c *Controller) error {
 }
 
 // expectSignal expects one buildsignal publish for the given build, asserting
-// the payload carries the build ID and the message partitions on it.
+// the payload carries the build ID, the message partitions on it, and its
+// identity is the build itself — the identity the receipt replays with.
 func expectSignal(t *testing.T, deps *testDeps, buildID string) {
 	t.Helper()
 	deps.publisher.EXPECT().Publish(gomock.Any(), "buildsignal", gomock.Any()).
@@ -194,6 +226,8 @@ func expectSignal(t *testing.T, deps *testDeps, buildID string) {
 			require.NoError(t, err)
 			assert.Equal(t, buildID, got.ID)
 			assert.Equal(t, "test-queue", msg.Tenant)
+			assert.Equal(t, buildID, msg.ID,
+				"recovery must replay the hand-off under the build's original identity")
 			assert.Equal(t, buildID, msg.PartitionKey,
 				"polls partition per build so one slow build cannot block a head's others")
 			return nil
@@ -259,18 +293,34 @@ func TestProcess_TriggersWithThePathsBase(t *testing.T) {
 				assert.Equal(t, "build-1", got.ID)
 				assert.Equal(t, "build-1", msg.PartitionKey,
 					"polls partition per build so one slow build cannot block a head's others")
+				*deps.receiptOps = append(*deps.receiptOps, "publish:buildsignal")
 				return nil
 			}),
 	)
 
 	require.NoError(t, process(t, ctrl, c))
+
+	// The link made the build findable first; the stage receipt, keyed by the
+	// build and carrying the exact identity the publish uses, lands before its
+	// message so a lost response replays the same one.
+	require.Len(t, *deps.createdReceipt, 1)
+	receipt := (*deps.createdReceipt)[0]
+	assert.Equal(t, "test-queue", receipt.Queue)
+	assert.Equal(t, headID, receipt.Head)
+	assert.Equal(t, entity.SpeculationStageBuildSignal, receipt.Stage)
+	assert.Equal(t, "build-1", receipt.Token)
+	assert.Equal(t, "build-1", receipt.MessageID)
+	assert.Equal(t, []string{"create:build-signal:build-1", "publish:buildsignal"}, *deps.receiptOps,
+		"the stage receipt is persisted before its message is published")
 }
 
-// The path set belongs to the speculate run. This stage must never write it, or
-// speculate loses compare-and-swap races across its far longer window. And a
-// cancelling entry is not this stage's work at all on an ordinary delivery —
-// the poll loop stops unwanted builds — so it must not even be looked up.
-func TestProcess_NeverWritesThePathSetAndIgnoresCancelling(t *testing.T) {
+// The path set belongs to the speculate run. This stage must never write it,
+// or speculate loses compare-and-swap races across its far longer window. A
+// cancelling entry is not started or cancelled from here — the poll loop stops
+// unwanted builds — but its link is still looked up on every delivery so the
+// conditional signal stage can make sure a build being stopped has a poll
+// chain watching it stop. An entry nothing dispatched yet simply finds no link.
+func TestProcess_NeverWritesThePathSetAndOnlyEnsuresSignalsForCancelling(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	c, deps := newTestController(t, ctrl, headBatch(entity.BatchStateSpeculating))
 
@@ -284,6 +334,10 @@ func TestProcess_NeverWritesThePathSetAndIgnoresCancelling(t *testing.T) {
 
 	deps.pathBuilds.EXPECT().Get(gomock.Any(), pending.ID, 1).
 		Return(entity.PathBuild{}, storage.ErrNotFound)
+	// The cancelling path is looked up but has no build, so nothing is
+	// published for it.
+	deps.pathBuilds.EXPECT().Get(gomock.Any(), "cancelling-path", 1).
+		Return(entity.PathBuild{}, storage.ErrNotFound)
 
 	deps.runner.EXPECT().Trigger(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(entity.BuildID{ID: "build-1"}, nil)
@@ -293,8 +347,8 @@ func TestProcess_NeverWritesThePathSetAndIgnoresCancelling(t *testing.T) {
 	}).Return(nil)
 	expectSignal(t, deps, "build-1")
 
-	// No pathSets.Update, no pathSets.Create, no runner.Cancel, and no lookup of
-	// the cancelling path: gomock fails the test on any of them.
+	// No pathSets.Update, no pathSets.Create, and no runner.Cancel: gomock
+	// fails the test on any of them.
 	require.NoError(t, process(t, ctrl, c))
 }
 
@@ -373,8 +427,9 @@ func TestProcess_LostDispatchRaceHandsBothBuildsToThePollLoop(t *testing.T) {
 	require.NoError(t, process(t, ctrl, c))
 }
 
-// A halted batch gets no new builds. Stopping its running ones is the poll
-// loop's job, so on a first delivery there is nothing else to do here.
+// A halted batch gets no new builds. Its entries' links are still reconciled
+// so a linked build keeps its poll chain — the poll loop is what stops it — but
+// entries nothing dispatched yet do nothing, and nothing is triggered.
 func TestProcess_HaltedBatchStartsNothing(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	c, deps := newTestController(t, ctrl, headBatch(entity.BatchStateCancelling))
@@ -386,18 +441,19 @@ func TestProcess_HaltedBatchStartsNothing(t *testing.T) {
 	deps.pathSets.EXPECT().Get(gomock.Any(), headID).Return(entity.SpeculationPathSet{
 		Head: headID, Paths: []entity.SpeculationPathEntry{pending, cancelling}, Version: 1,
 	}, nil)
+	deps.pathBuilds.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(entity.PathBuild{}, storage.ErrNotFound).AnyTimes()
 
-	// No lookups, no Trigger, no Cancel, no publishes: gomock fails the test if
-	// anything is started or stopped from here.
+	// No Trigger, no Cancel, no publishes: gomock fails the test if anything
+	// is started or stopped from here.
 	require.NoError(t, process(t, ctrl, c))
 }
 
-// A redelivery means an earlier attempt died without acking — possibly between
-// writing a link and publishing its signal, after which the entry may have
-// moved to a state no start would touch. Every live linked path therefore gets
-// its signal re-published, so no build is left without a poll chain. The
-// re-publish dedups against the original signal whenever it was actually sent.
-func TestProcess_RedeliveryRepublishesSignalsForLivePaths(t *testing.T) {
+// Every live linked path has its signal ensured on any delivery — a first
+// delivery as much as a redelivery — because the durable receipt, not a
+// delivery counter, is what resumes a hand-off that died between the link and
+// the publish. Each publish reuses the build's original identity.
+func TestProcess_EnsuresSignalsForLivePathsOnAnyDelivery(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	c, deps := newTestController(t, ctrl, headBatch(entity.BatchStateCancelling))
 
@@ -427,7 +483,33 @@ func TestProcess_RedeliveryRepublishesSignalsForLivePaths(t *testing.T) {
 
 	// The terminal path is never looked up, the unlinked one publishes nothing,
 	// and no build is started or cancelled from here.
-	require.NoError(t, processAttempt(t, ctrl, c, 2))
+	require.NoError(t, process(t, ctrl, c))
+}
+
+// A delivery that finds the signal receipt already there does not create it
+// again and still publishes under the identity the receipt holds — the resume
+// path a restart or a dead-letter republish takes.
+func TestProcess_ReusesExistingSignalReceipt(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	c, deps := newTestController(t, ctrl, headBatch(entity.BatchStateSpeculating))
+
+	entry := pathEntry(entity.SpeculationPathStatusBuilding, 1)
+	deps.pathSets.EXPECT().Get(gomock.Any(), headID).Return(entity.SpeculationPathSet{
+		Head: headID, Paths: []entity.SpeculationPathEntry{entry}, Version: 1,
+	}, nil)
+	deps.pathBuilds.EXPECT().Get(gomock.Any(), entry.ID, 1).
+		Return(entity.PathBuild{PathID: entry.ID, Attempt: 1, BuildID: "build-existing"}, nil)
+
+	deps.seededReceipts[headID+"/"+string(entity.SpeculationStageBuildSignal)+"/build-existing"] =
+		entity.SpeculationReceipt{
+			Queue: "test-queue", Head: headID,
+			Stage: entity.SpeculationStageBuildSignal, Token: "build-existing", MessageID: "build-existing",
+		}
+
+	expectSignal(t, deps, "build-existing")
+
+	require.NoError(t, process(t, ctrl, c))
+	assert.Empty(t, *deps.createdReceipt, "a replayed stage must not create its receipt again")
 }
 
 // TestProcess_NoPathSet covers a head nothing has speculated on yet.

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/uber/submitqueue/platform/metrics"
@@ -26,6 +27,7 @@ import (
 	"github.com/uber/submitqueue/submitqueue/entity"
 	storage "github.com/uber/submitqueue/submitqueue/extension/storage"
 	corebatch "github.com/uber/submitqueue/submitqueue/orchestrator/core/batch"
+	corereceipt "github.com/uber/submitqueue/submitqueue/orchestrator/core/receipt"
 	corerequest "github.com/uber/submitqueue/submitqueue/orchestrator/core/request"
 	orchstorage "github.com/uber/submitqueue/submitqueue/orchestrator/extension/storage"
 )
@@ -99,12 +101,21 @@ func (c *Controller) finalize(ctx context.Context, snap *snapshot) error {
 			if decision == outcomeLand {
 				// The winning path carries the head out of the queue; its
 				// siblings cannot help it any more and are still holding CI
-				// slots the rest of the queue could use.
+				// slots the rest of the queue could use. The winner is the
+				// winner-selection stage's durable record: it rides the same
+				// set version as the supersede, and only survives while the
+				// batch compare-and-swap below makes this decision the one
+				// that committed.
 				winner, ok := landablePath(set, *snap)
 				if !ok {
 					winner, bypassed = bypassablePath(batch, set, *snap)
 				}
+				changed := set.WinnerPathID != winner.ID
+				set.WinnerPathID = winner.ID
 				if supersede(&set, winner.ID, nowMs) {
+					changed = true
+				}
+				if changed {
 					snap.pathSets[batch.ID] = set
 					snap.markDirty(batch.ID)
 				}
@@ -210,7 +221,7 @@ func (c *Controller) finalizeCancellations(ctx context.Context, snap *snapshot, 
 		metrics.NamedCounter(c.metricsScope, opName, "cancel_batch", 1)
 
 		set, exists := snap.pathSets[batch.ID]
-		if exists && cancelAllPaths(&set, nowMs) {
+		if exists && convergeToCancel(&set, nowMs) {
 			snap.pathSets[batch.ID] = set
 			snap.markDirty(batch.ID)
 		}
@@ -271,7 +282,7 @@ func (c *Controller) commitOutcome(ctx context.Context, snap *snapshot, batch en
 	// Attributed here rather than at each leaf: this is the one place that
 	// knows which batch the whole commit is for, and the finalize loop runs it
 	// over every decided batch in the queue — rarely the one on the message.
-	landed, err := c.applyOutcome(ctx, snap.store, batch, decision, snap.isTrigger(batch.ID))
+	landed, err := c.applyOutcome(ctx, snap, batch, decision)
 	if err != nil {
 		return landed, c.attributed(err, entity.BatchSubject(batch.ID))
 	}
@@ -304,7 +315,9 @@ func (c *Controller) recordOutcome(snap *snapshot, batchID string, decision outc
 // consumer can act on an outcome a lost compare-and-swap refused to write. The
 // cost is a dispatch that fails on a batch finalize no longer walks, which the
 // recovery message and Process's self-heal exist to repair.
-func (c *Controller) applyOutcome(ctx context.Context, store orchstorage.Storage, batch entity.Batch, decision outcome, isTriggerBatch bool) (bool, error) {
+func (c *Controller) applyOutcome(ctx context.Context, snap *snapshot, batch entity.Batch, decision outcome) (bool, error) {
+	store := snap.store
+
 	var state entity.BatchState
 
 	switch decision {
@@ -320,7 +333,7 @@ func (c *Controller) applyOutcome(ctx context.Context, store orchstorage.Storage
 		return false, nil
 	}
 
-	if !isTriggerBatch {
+	if !snap.isTrigger(batch.ID) {
 		if err := c.recoverable(ctx, store, batch); err != nil {
 			return false, err
 		}
@@ -330,9 +343,16 @@ func (c *Controller) applyOutcome(ctx context.Context, store orchstorage.Storage
 	// state. A raw CAS would leave the batch filed under the bucket it just
 	// left, and since records are only ever added, every later run of this
 	// queue would go on listing and hydrating it.
-	if _, err := corebatch.Transition(ctx, store, batch, state); err != nil {
+	updated, err := corebatch.Transition(ctx, store, batch, state)
+	if err != nil {
 		if errors.Is(err, storage.ErrVersionMismatch) {
 			metrics.NamedCounter(c.metricsScope, opName, "outcome_cas_lost", 1)
+			// A lost land can be a cancel that won the arbitration. The set
+			// already names a winner; converge it to the cancel that owns the
+			// batch rather than leaving the durable decision split.
+			if decision == outcomeLand {
+				c.convergeLostLand(ctx, snap, batch)
+			}
 			return false, nil
 		}
 		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
@@ -341,15 +361,19 @@ func (c *Controller) applyOutcome(ctx context.Context, store orchstorage.Storage
 
 	metrics.NamedCounter(c.metricsScope, opName, "outcome", 1, metrics.NewTag("outcome", string(decision)))
 	c.logger.Infow("batch outcome",
-		"batch_id", batch.ID,
-		"queue", batch.Queue,
+		"batch_id", updated.ID,
+		"queue", updated.Queue,
 		"outcome", string(decision),
 		"state", string(state),
 	)
 
 	switch decision {
 	case outcomeLand:
-		if err := c.dispatchLand(ctx, batch); err != nil {
+		// The batch CAS is the arbitration: only the decision that won may
+		// create a land receipt or publish, so a cancel that lost the race
+		// can never also hand the head to land. updated carries the version
+		// the receipt's generation token names.
+		if err := c.dispatchLand(ctx, store, updated); err != nil {
 			return true, err
 		}
 
@@ -375,10 +399,24 @@ func (c *Controller) applyOutcome(ctx context.Context, store orchstorage.Storage
 }
 
 // dispatchLand reports speculation finished and hands the batch to the land
-// stage. The stable ID means a redelivery or the Landing self-heal dedupes
-// against the request already sent instead of landing twice; the status goes
-// first so it cannot be timestamped after the landing the dispatch triggers.
-func (c *Controller) dispatchLand(ctx context.Context, batch entity.Batch) error {
+// stage, resuming from the stage's durable receipt. The receipt is the
+// conditional stage's confirmation — created only once the batch
+// compare-and-swap into Landing has won, before either message is published —
+// so a redelivery after an uncertain publish, a controller restart, or a
+// dead-letter republish reuses the receipt's original MessageID instead of
+// landing the batch twice, independent of the queue's deduplication window.
+// The status goes first so it cannot be timestamped after the landing the
+// dispatch triggers.
+//
+// batch must already be in Landing: callers are the outcome that just won the
+// transition and Process's Landing self-heal, which is also how this recovers
+// after a failure anywhere below.
+func (c *Controller) dispatchLand(ctx context.Context, store orchstorage.Storage, batch entity.Batch) error {
+	receipt, err := c.ensureLandReceipt(ctx, store, batch)
+	if err != nil {
+		return err
+	}
+
 	if err := corerequest.PublishBatchLogs(ctx, c.registry, batch.Queue, batch.Contains,
 		entity.RequestStatusSpeculated, batch.ID, map[string]string{"batch_id": batch.ID},
 	); err != nil {
@@ -386,11 +424,39 @@ func (c *Controller) dispatchLand(ctx context.Context, batch entity.Batch) error
 		return fmt.Errorf("failed to publish request logs for batch %s: %w", batch.ID, err)
 	}
 
-	if err := c.publishBatchID(ctx, topickey.TopicKeyLand, publish.IntentID(batch.ID, "land-dispatch"), batch.ID, batch.Queue, batch.Queue); err != nil {
+	if err := c.publishBatchID(ctx, topickey.TopicKeyLand, receipt.MessageID, batch.ID, batch.Queue, batch.Queue); err != nil {
 		metrics.NamedCounter(c.metricsScope, opName, "publish_errors", 1)
 		return fmt.Errorf("failed to publish batch %s to land: %w", batch.ID, err)
 	}
 	return nil
+}
+
+// ensureLandReceipt returns the head's land-dispatch receipt, creating it when
+// this is the first dispatch after the Landing commit. The token is the batch
+// version the decision committed at — the decision generation — so a decision
+// an older batch version lost can never acquire a receipt on the new one. The
+// MessageID is fixed per head, keeping the wire identity stable across this
+// version and any earlier deployment that published without a receipt.
+func (c *Controller) ensureLandReceipt(ctx context.Context, store orchstorage.Storage, batch entity.Batch) (entity.SpeculationReceipt, error) {
+	want := entity.SpeculationReceipt{
+		Queue:       batch.Queue,
+		Head:        batch.ID,
+		Stage:       entity.SpeculationStageLandDispatch,
+		Token:       strconv.FormatInt(int64(batch.Version), 10),
+		MessageID:   publish.IntentID(batch.ID, "land-dispatch"),
+		CreatedAtMs: time.Now().UnixMilli(),
+	}
+	got, created, err := corereceipt.Ensure(ctx, store.GetSpeculationReceiptStore(), want)
+	if err != nil {
+		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
+		return entity.SpeculationReceipt{}, fmt.Errorf("failed to ensure land receipt for batch %s: %w", batch.ID, err)
+	}
+	if created {
+		metrics.NamedCounter(c.metricsScope, opName, "land_receipt_created", 1)
+	} else {
+		metrics.NamedCounter(c.metricsScope, opName, "land_receipt_reused", 1)
+	}
+	return got, nil
 }
 
 // recoverable gives a batch a message of its own before this run moves it out
@@ -472,6 +538,71 @@ func cancelAllPaths(set *entity.SpeculationPathSet, nowMs int64) bool {
 	return markCancelling(set, nowMs, func(entity.SpeculationPathEntry) bool {
 		return false
 	})
+}
+
+// convergeToCancel undoes a land decision's set changes and stops every live
+// path: the winner a land recorded is cleared alongside its supersede. Used
+// when a cancellation owns the batch — either the batch was read Cancelling or
+// a land's batch compare-and-swap lost to one the run had not read yet.
+func convergeToCancel(set *entity.SpeculationPathSet, nowMs int64) bool {
+	changed := set.WinnerPathID != ""
+	set.WinnerPathID = ""
+	if cancelAllPaths(set, nowMs) {
+		changed = true
+	}
+	return changed
+}
+
+// convergeLostLand reconciles a head whose land lost the batch
+// compare-and-swap to a cancellation that committed first. The set this run
+// persisted already names the winner and superseded siblings; the batch now
+// belongs to the cancel, so clear the winner and stop every live path, closing
+// the split decision in the same run rather than leaving a winner recorded for
+// a batch that must never land.
+//
+// Best effort by design: correctness does not depend on this write landing.
+// The batch CAS already arbitrated — no land receipt exists and no land was
+// published — and the next run's finalizeCancellations applies the identical
+// convergence before driving the batch to Cancelled. A lost set
+// compare-and-swap means that next run already owns the set.
+func (c *Controller) convergeLostLand(ctx context.Context, snap *snapshot, batch entity.Batch) {
+	current, err := snap.store.GetBatchStore().Get(ctx, batch.ID)
+	if err != nil {
+		metrics.NamedCounter(c.metricsScope, opName, "storage_errors", 1)
+		c.logger.Warnw("a land lost its compare-and-swap; could not re-read the batch to converge",
+			"batch_id", batch.ID,
+			"error", err,
+		)
+		return
+	}
+	if current.State != entity.BatchStateCancelling && current.State != entity.BatchStateCancelled {
+		// Another writer won, but not the cancellation; leave convergence to
+		// whichever decision now owns the batch.
+		return
+	}
+
+	set, exists := snap.pathSets[batch.ID]
+	if !exists || !convergeToCancel(&set, time.Now().UnixMilli()) {
+		return
+	}
+	stored, err := c.persist(ctx, snap.store, set, true)
+	if err != nil {
+		if errors.Is(err, storage.ErrVersionMismatch) {
+			return
+		}
+		metrics.NamedCounter(c.metricsScope, opName, "land_converge_errors", 1)
+		c.logger.Warnw("failed to converge a head whose land lost to cancellation",
+			"batch_id", batch.ID,
+			"error", err,
+		)
+		return
+	}
+	snap.pathSets[batch.ID] = stored
+	metrics.NamedCounter(c.metricsScope, opName, "land_converged_to_cancel", 1)
+	c.logger.Infow("a land lost the arbitration to a cancellation; converged the head's paths",
+		"batch_id", batch.ID,
+		"queue", current.Queue,
+	)
 }
 
 // allPathsStopped reports whether none of the head's paths still holds a

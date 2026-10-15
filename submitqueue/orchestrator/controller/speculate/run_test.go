@@ -76,8 +76,14 @@ type runHarness struct {
 	pathSets   *storagemock.MockSpeculationPathSetStore
 	pathBuilds *storagemock.MockPathBuildStore
 	builds     *storagemock.MockBuildStore
-	spec       *scriptedSpeculator
-	published  []string
+	receipts   *storagemock.MockSpeculationReceiptStore
+	// seededReceipts holds receipts a test wants the store to find, keyed
+	// head/stage/token; everything else reads absent.
+	seededReceipts map[string]entity.SpeculationReceipt
+	// createdReceipts records every receipt a run wrote, in order.
+	createdReceipts []entity.SpeculationReceipt
+	spec            *scriptedSpeculator
+	published       []string
 	// filed and unfiled are the queue's membership-record writes: a state
 	// change has to move the record, or the batch stays listed under the
 	// bucket it left and every later run re-reads it.
@@ -93,6 +99,14 @@ type runHarness struct {
 	failTopic string
 	// metrics records the controller's emitted counters for outcome assertions.
 	metrics tally.TestScope
+	// batchByID backs the batch store's Get: a test flips a batch mid-run by
+	// replacing its entry, simulating a write another controller committed.
+	batchByID map[string]entity.Batch
+}
+
+// setBatch replaces the batch a Get of id returns from then on.
+func (h *runHarness) setBatch(b entity.Batch) {
+	h.batchByID[b.ID] = b
 }
 
 // failPublishTo makes publishes to one topic fail, leaving the others working,
@@ -121,11 +135,24 @@ func (h *runHarness) run(triggerID string) error {
 func newRunHarness(t *testing.T, ctrl *gomock.Controller, spec *scriptedSpeculator, inFlight []entity.Batch) *runHarness {
 	t.Helper()
 
-	h := &runHarness{spec: spec, metrics: tally.NewTestScope("test", nil)}
+	h := &runHarness{
+		spec:           spec,
+		metrics:        tally.NewTestScope("test", nil),
+		seededReceipts: map[string]entity.SpeculationReceipt{},
+	}
 
 	h.batches = storagemock.NewMockBatchStore(ctrl)
+	h.batchByID = make(map[string]entity.Batch, len(inFlight))
 	for _, b := range inFlight {
-		h.batches.EXPECT().Get(gomock.Any(), b.ID).Return(b, nil).AnyTimes()
+		id := b.ID
+		h.batchByID[id] = b
+		// One exact-ID expectation per in-flight batch, read through the
+		// mutable map so a test can flip the batch mid-run; dependencies that
+		// are not in flight register their own expectations.
+		h.batches.EXPECT().Get(gomock.Any(), id).
+			DoAndReturn(func(_ context.Context, _ string) (entity.Batch, error) {
+				return h.batchByID[id], nil
+			}).AnyTimes()
 	}
 
 	// The queue read goes through the membership records: List answers per
@@ -158,6 +185,23 @@ func newRunHarness(t *testing.T, ctrl *gomock.Controller, spec *scriptedSpeculat
 	h.pathSets = storagemock.NewMockSpeculationPathSetStore(ctrl)
 	h.pathBuilds = storagemock.NewMockPathBuildStore(ctrl)
 	h.builds = storagemock.NewMockBuildStore(ctrl)
+	h.receipts = storagemock.NewMockSpeculationReceiptStore(ctrl)
+
+	// One Get/Create expectation each: found receipts come from the test's
+	// seed map, writes are recorded so a test can assert which stages a run
+	// committed and under what message identity.
+	h.receipts.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, head string, stage entity.SpeculationReceiptStage, token string) (entity.SpeculationReceipt, error) {
+			if r, ok := h.seededReceipts[head+"/"+string(stage)+"/"+token]; ok {
+				return r, nil
+			}
+			return entity.SpeculationReceipt{}, storage.ErrNotFound
+		}).AnyTimes()
+	h.receipts.EXPECT().Create(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, r entity.SpeculationReceipt) error {
+			h.createdReceipts = append(h.createdReceipts, r)
+			return nil
+		}).AnyTimes()
 
 	store := orchstoragemock.NewMockStorage(ctrl)
 	h.store = store
@@ -166,6 +210,7 @@ func newRunHarness(t *testing.T, ctrl *gomock.Controller, spec *scriptedSpeculat
 	store.EXPECT().GetSpeculationPathSetStore().Return(h.pathSets).AnyTimes()
 	store.EXPECT().GetPathBuildStore().Return(h.pathBuilds).AnyTimes()
 	store.EXPECT().GetBuildStore().Return(h.builds).AnyTimes()
+	store.EXPECT().GetSpeculationReceiptStore().Return(h.receipts).AnyTimes()
 
 	pub := queuemock.NewMockPublisher(ctrl)
 	pub.EXPECT().Publish(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
@@ -645,8 +690,14 @@ func TestRun_DecidedHeadIsNotSpeculatedOn(t *testing.T) {
 		Version: 1,
 	}, nil)
 
-	// The head moves to landing. Its set is untouched: the only path is the
-	// winner, and no proposal was applied.
+	// The head moves to landing. Its winner is the one path and the winner
+	// selection is persisted with the decision even though no sibling is
+	// superseded and no proposal was applied.
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).
+		DoAndReturn(func(_ context.Context, s entity.SpeculationPathSet, _, _ int32) error {
+			assert.Equal(t, s.Paths[0].ID, s.WinnerPathID)
+			return nil
+		})
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).
 		Return(nil)
@@ -722,6 +773,7 @@ func TestRun_LandableHeadDispatchesAfterTheStateWrite(t *testing.T) {
 		Version: 1,
 	}, nil).AnyTimes()
 
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).Return(nil).AnyTimes()
 	var publishedBeforeWrite []string
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).
@@ -737,7 +789,8 @@ func TestRun_LandableHeadDispatchesAfterTheStateWrite(t *testing.T) {
 }
 
 // The other half: a lost write means another writer owns the batch, so the
-// dispatch it would have justified is never sent.
+// dispatch it would have justified is never sent — no land receipt is created
+// either, so no recovery path can turn the lost decision into a land.
 func TestRun_LandableHeadDispatchesNothingWhenTheStateCASLoses(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	passed := pathOver(entity.DependencyAssumptionSucceeds, entity.DependencyAssumptionSucceeds)
@@ -751,12 +804,79 @@ func TestRun_LandableHeadDispatchesNothingWhenTheStateCASLoses(t *testing.T) {
 		Paths:   []entity.SpeculationPathEntry{entryFor(passed, entity.SpeculationPathStatusPassed)},
 		Version: 1,
 	}, nil).AnyTimes()
+	// The winner selection lands in the set first; the batch write then loses.
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).Return(nil)
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).
 		Return(storage.ErrVersionMismatch)
 
 	require.NoError(t, h.run(head))
 	assert.Empty(t, h.published)
+	assert.Empty(t, h.createdReceipts,
+		"a decision whose batch write lost must not hold a receipt for a land")
+}
+
+// When a land and a cancellation are committed concurrently, the batch
+// compare-and-swap is the only arbitration. Here the cancel's write lands
+// first: the winner selection has already been persisted with its siblings
+// stopped, so the run converges that very set to the cancellation — winner
+// cleared — creates no land receipt, and publishes no land. A decision read
+// from the old batch version cannot act on the new one.
+func TestRun_LandLosingTheArbitrationToCancelConvergesAndNeverLands(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	winner := pathOver(entity.DependencyAssumptionSucceeds, entity.DependencyAssumptionSucceeds)
+	sibling := pathOver(entity.DependencyAssumptionFails, entity.DependencyAssumptionFails)
+
+	h := newRunHarness(t, ctrl, &scriptedSpeculator{}, []entity.Batch{speculatingHead()})
+
+	// The read sees the head Speculating at version 1; the re-read after the
+	// lost compare-and-swap sees the cancellation committed at version 2.
+	h.batches.EXPECT().Get(gomock.Any(), dep1).Return(entity.Batch{ID: dep1, State: entity.BatchStateSucceeded}, nil)
+	h.batches.EXPECT().Get(gomock.Any(), dep2).Return(entity.Batch{ID: dep2, State: entity.BatchStateSucceeded}, nil)
+
+	h.pathSets.EXPECT().Get(gomock.Any(), head).Return(entity.SpeculationPathSet{
+		Head: head,
+		Paths: []entity.SpeculationPathEntry{
+			entryFor(winner, entity.SpeculationPathStatusPassed),
+			entryFor(sibling, entity.SpeculationPathStatusBuilding),
+		},
+		Version: 1,
+	}, nil)
+	h.pathBuilds.EXPECT().Get(gomock.Any(), sibling.ID(), 1).
+		Return(entity.PathBuild{PathID: sibling.ID(), Attempt: 1, BuildID: "b1"}, nil)
+	h.builds.EXPECT().Get(gomock.Any(), "b1").
+		Return(entity.Build{ID: "b1", BatchID: head, Status: entity.BuildStatusRunning}, nil)
+
+	// First set write: winner named, sibling superseded.
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).
+		DoAndReturn(func(_ context.Context, s entity.SpeculationPathSet, _, _ int32) error {
+			assert.Equal(t, winner.ID(), s.WinnerPathID)
+			assert.Equal(t, entity.SpeculationPathStatusCancelling, s.Paths[1].Status)
+			return nil
+		})
+	// The land's batch write loses to the cancellation, which a concurrent
+	// writer has just committed.
+	h.batches.EXPECT().
+		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).
+		DoAndReturn(func(context.Context, entity.Batch, int32, int32) error {
+			h.setBatch(entity.Batch{ID: head, Queue: "q", State: entity.BatchStateCancelling, Version: 2})
+			return storage.ErrVersionMismatch
+		})
+	// Convergence: the set is rewritten for the cancel that won, with the
+	// winner gone. Its live sibling is already marked cancelling.
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(2), int32(3)).
+		DoAndReturn(func(_ context.Context, s entity.SpeculationPathSet, _, _ int32) error {
+			assert.Empty(t, s.WinnerPathID, "a winner a cancel outran must not survive")
+			assert.Equal(t, entity.SpeculationPathStatusCancelling, s.Paths[1].Status)
+			return nil
+		})
+
+	require.NoError(t, h.run(head))
+	assert.Empty(t, h.published, "the losing decision hands nothing to land")
+	assert.Empty(t, h.createdReceipts, "the losing decision holds no land receipt")
+
+	counters := h.metrics.Snapshot().Counters()
+	assert.Contains(t, counters, "test.speculate_controller.process.land_converged_to_cancel+")
 }
 
 // A head with no future left fails, and the write order is what keeps conclude
@@ -1113,38 +1233,42 @@ func TestFanout_MintsADistinctMessageIDPerPublish(t *testing.T) {
 	assert.NotEqual(t, ids[0], ids[1])
 }
 
-// The land dispatch is the mirror image: a batch lands once, so the ID has
-// to be stable across the redelivery and the self-heal that both re-derive it.
+// The land dispatch is the mirror image: a batch lands once, so its receipt is
+// created once and the message ID stays stable across the redelivery and the
+// self-heal that both re-derive it — recovery reuses the original identity.
 func TestDispatchLand_ReusesOneMessageIDPerBatch(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
+	h := newRunHarness(t, ctrl, &scriptedSpeculator{}, nil)
+	batch := entity.Batch{ID: head, Queue: "q", State: entity.BatchStateLanding, Version: 2}
+
+	// First dispatch commits the receipt and publishes.
+	require.NoError(t, h.controller.dispatchLand(context.Background(), h.store, batch))
+
+	// A replay (restart, redelivery, dead-letter republish) finds the receipt
+	// in storage, as the second delivery would.
+	require.Len(t, h.createdReceipts, 1)
+	first := h.createdReceipts[0]
+	h.seededReceipts[head+"/"+string(entity.SpeculationStageLandDispatch)+"/2"] = first
+
+	require.NoError(t, h.controller.dispatchLand(context.Background(), h.store, batch))
+
 	var ids []string
-	pub := queuemock.NewMockPublisher(ctrl)
-	pub.EXPECT().Publish(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ string, msg entityqueue.Message) error {
-			ids = append(ids, msg.ID)
-			return nil
-		},
-	).Times(2)
-	q := queuemock.NewMockQueue(ctrl)
-	q.EXPECT().Publisher().Return(pub).AnyTimes()
-
-	registry, err := consumer.NewTopicRegistry([]consumer.TopicConfig{
-		{Key: topickey.TopicKeyLand, Name: "submitqueue-land", Queue: q},
-	})
-	require.NoError(t, err)
-
-	c := NewController(
-		zaptest.NewLogger(t).Sugar(), tally.NoopScope, staticStorageFactory{store: orchstoragemock.NewMockStorage(ctrl)},
-		staticSpeculatorFactory{}, registry, topickey.TopicKeySpeculate, "orchestrator-speculate",
-	)
-	batch := entity.Batch{ID: head, Queue: "q"}
-
-	require.NoError(t, c.dispatchLand(context.Background(), batch))
-	require.NoError(t, c.dispatchLand(context.Background(), batch))
-
+	for _, msg := range h.messages {
+		ids = append(ids, msg.ID)
+	}
 	require.Len(t, ids, 2)
-	assert.Equal(t, ids[0], ids[1])
+	assert.Equal(t, ids[0], ids[1], "recovery reuses the original message identity")
+	assert.Equal(t, head+"/land-dispatch", ids[0])
+
+	// The receipt is the conditional stage's one confirmation, keyed by the
+	// batch version the Landing transition committed at.
+	require.Len(t, h.createdReceipts, 1)
+	assert.Equal(t, "q", first.Queue)
+	assert.Equal(t, head, first.Head)
+	assert.Equal(t, entity.SpeculationStageLandDispatch, first.Stage)
+	assert.Equal(t, "2", first.Token)
+	assert.Equal(t, ids[0], first.MessageID)
 }
 
 // cascadePair wires a queue where `prerequisite` reaches a terminal outcome
@@ -1362,6 +1486,7 @@ func TestRun_CascadeDerivedBatchIsGivenARecoverySignalBeforeItLands(t *testing.T
 		Paths:   []entity.SpeculationPathEntry{entryFor(passedPath, entity.SpeculationPathStatusPassed)},
 		Version: 1,
 	}, nil).AnyTimes()
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).Return(nil).AnyTimes()
 
 	var publishedBeforeWrite []string
 	h.batches.EXPECT().
@@ -1543,6 +1668,7 @@ func TestRun_LandingHeadReportsSpeculatedAndNoWait(t *testing.T) {
 		Paths:   []entity.SpeculationPathEntry{entryFor(passed, entity.SpeculationPathStatusPassed)},
 		Version: 1,
 	}, nil).AnyTimes()
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).Return(nil)
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).Return(nil)
 
@@ -1575,6 +1701,13 @@ func TestRun_BypassesUnsettledDependenciesWithFullCoverage(t *testing.T) {
 		},
 		Version: 1,
 	}, nil).AnyTimes()
+	// The bypass winner is recorded as the winner-selection stage, even though
+	// its passed siblings are terminal and nothing gets superseded.
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).
+		DoAndReturn(func(_ context.Context, s entity.SpeculationPathSet, _, _ int32) error {
+			assert.NotEmpty(t, s.WinnerPathID, "a bypass still names its winner")
+			return nil
+		})
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).Return(nil)
 
@@ -1607,6 +1740,7 @@ func TestRun_SpeculatedIsReportedBeforeTheLandDispatch(t *testing.T) {
 		Paths:   []entity.SpeculationPathEntry{entryFor(passed, entity.SpeculationPathStatusPassed)},
 		Version: 1,
 	}, nil).AnyTimes()
+	h.pathSets.EXPECT().Update(gomock.Any(), gomock.Any(), int32(1), int32(2)).Return(nil)
 	h.batches.EXPECT().
 		Update(gomock.Any(), updateTo{id: head, state: entity.BatchStateLanding}, int32(1), int32(2)).Return(nil)
 
@@ -1614,6 +1748,11 @@ func TestRun_SpeculatedIsReportedBeforeTheLandDispatch(t *testing.T) {
 
 	require.Len(t, h.logs, 1)
 	assert.Equal(t, entity.RequestStatusSpeculated, h.logs[0].Status)
+
+	// The durable receipt outlives the failed publish: a replay finds it and
+	// re-sends the land under its identity instead of deciding the head again.
+	require.Len(t, h.createdReceipts, 1)
+	assert.Equal(t, entity.SpeculationStageLandDispatch, h.createdReceipts[0].Stage)
 }
 
 // A batch left in Created is dependency-eligible but has nothing driving it

@@ -15,6 +15,7 @@ go_library(
         "//submitqueue/entity:go_default_library",
         "//submitqueue/extension/buildrunner:go_default_library",
         "//submitqueue/extension/storage:go_default_library",
+        "//submitqueue/orchestrator/core/receipt:go_default_library",
         "//submitqueue/orchestrator/extension/storage:go_default_library",
         "@com_github_uber_go_tally//:go_default_library",
         "@org_uber_go_zap//:go_default_library",

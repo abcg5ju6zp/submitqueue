@@ -52,9 +52,9 @@ func (s *speculationPathSetStore) Get(ctx context.Context, head string) (ret ent
 	var pathsJSON []byte
 
 	err := s.db.QueryRowContext(ctx,
-		"SELECT queue, head, paths, version FROM speculation_path_set WHERE queue = ? AND head = ?",
+		"SELECT queue, head, paths, winner_path_id, version FROM speculation_path_set WHERE queue = ? AND head = ?",
 		s.queue, head,
-	).Scan(&set.Queue, &set.Head, &pathsJSON, &set.Version)
+	).Scan(&set.Queue, &set.Head, &pathsJSON, &set.WinnerPathID, &set.Version)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return entity.SpeculationPathSet{}, storage.WrapNotFound(err)
@@ -85,8 +85,8 @@ func (s *speculationPathSetStore) Create(ctx context.Context, set entity.Specula
 	}
 
 	_, err = s.db.ExecContext(ctx,
-		"INSERT INTO speculation_path_set (queue, head, paths, version) VALUES (?, ?, ?, ?)",
-		set.Queue, set.Head, pathsJSON, set.Version,
+		"INSERT INTO speculation_path_set (queue, head, paths, winner_path_id, version) VALUES (?, ?, ?, ?, ?)",
+		set.Queue, set.Head, pathsJSON, set.WinnerPathID, set.Version,
 	)
 	if err != nil {
 		var mysqlErr *mysql.MySQLError
@@ -116,8 +116,8 @@ func (s *speculationPathSetStore) Update(ctx context.Context, set entity.Specula
 	}
 
 	result, err := s.db.ExecContext(ctx,
-		"UPDATE speculation_path_set SET paths = ?, version = ? WHERE queue = ? AND head = ? AND version = ?",
-		pathsJSON, newVersion, set.Queue, set.Head, oldVersion,
+		"UPDATE speculation_path_set SET paths = ?, winner_path_id = ?, version = ? WHERE queue = ? AND head = ? AND version = ?",
+		pathsJSON, set.WinnerPathID, newVersion, set.Queue, set.Head, oldVersion,
 	)
 	if err != nil {
 		return fmt.Errorf(

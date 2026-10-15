@@ -60,6 +60,7 @@ func (s *Storage) For(queueName string) (storage.Storage, error) {
 		buildStore:              NewBuildStore(s.db, s.scope.SubScope("build_store"), queueName),
 		speculationPathSetStore: NewSpeculationPathSetStore(s.db, s.scope.SubScope("speculation_path_set_store"), queueName),
 		pathBuildStore:          NewPathBuildStore(s.db, s.scope.SubScope("path_build_store"), queueName),
+		speculationReceiptStore: NewSpeculationReceiptStore(s.db, s.scope.SubScope("speculation_receipt_store"), queueName),
 	}, nil
 }
 
@@ -79,6 +80,7 @@ type boundStorage struct {
 	buildStore              basestorage.BuildStore
 	speculationPathSetStore basestorage.SpeculationPathSetStore
 	pathBuildStore          basestorage.PathBuildStore
+	speculationReceiptStore basestorage.SpeculationReceiptStore
 }
 
 // Verify boundStorage implements the queue-scoped aggregate at compile time.
@@ -127,4 +129,9 @@ func (f *boundStorage) GetSpeculationPathSetStore() basestorage.SpeculationPathS
 // GetPathBuildStore returns the bound MySQL-backed PathBuildStore.
 func (f *boundStorage) GetPathBuildStore() basestorage.PathBuildStore {
 	return f.pathBuildStore
+}
+
+// GetSpeculationReceiptStore returns the bound MySQL-backed SpeculationReceiptStore.
+func (f *boundStorage) GetSpeculationReceiptStore() basestorage.SpeculationReceiptStore {
+	return f.speculationReceiptStore
 }

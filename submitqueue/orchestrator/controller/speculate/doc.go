@@ -104,6 +104,43 @@
 // Failed and Cancelled fan out to the conclude stage, which reconciles the
 // batch's requests.
 //
+// # Conditional stages and receipts
+//
+// A head moves through its stages conditionally, each with a stable
+// generation and a durable confirmation, so a redelivery, a controller
+// restart, or a dead-letter republish resumes instead of re-enacting:
+//
+//   - A path's run generation is its (ID, Attempt): the build link, the poll
+//     chain, and the build-signal receipt are all correlated by it, so an old
+//     signal can never act on a later attempt.
+//   - Build start is confirmed by the write-once PathBuild link; a linked
+//     build is never triggered again.
+//   - The build-signal hand-off is a stage receipt: the build stage writes it
+//     before publishing and re-publishes under the receipt's message ID on
+//     recovery, instead of relying on a redelivery counter or the queue's
+//     deduplication window.
+//   - Cancel is the path status itself (cancelling then cancelled); the poll
+//     loop is level-triggered off the set, so there is no cancel message to
+//     go stale.
+//   - Winner selection is WinnerPathID in the path set, written in the same
+//     version that supersedes the winner's siblings.
+//   - The batch transition is the only arbitration between a land and a
+//     concurrent cancellation: the compare-and-swap on the batch version is
+//     what decides which decision committed, and a decision read from an old
+//     version cannot write the new one. A land that loses to a cancellation
+//     has its winner cleared and its paths converged to cancelling; it
+//     neither receives a receipt nor reaches land.
+//   - The land hand-off is a stage receipt keyed by the batch version the
+//     Landing transition committed at. It is created after that transition
+//     wins and before the land message is published, so an uncertain publish
+//     response is recovered with the original message identity and a batch is
+//     never landed twice.
+//
+// Receipts are immutable create-once records of their own
+// (SpeculationReceipt), separate from the versioned path set: a stage's
+// confirmation is append-only history, while the set stays the replaced
+// snapshot of the head's current paths.
+//
 // # How a run works
 //
 // Every message is only a dirty signal — "this queue changed" — naming the
