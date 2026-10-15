@@ -17,6 +17,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"testing"
 
@@ -112,21 +113,71 @@ func TestOffsetStore_GetAckedOffset(t *testing.T) {
 }
 
 func TestOffsetStore_UpdateAckedOffset(t *testing.T) {
-	db, mock, store := setupoffsetStoreTest(t)
-	defer db.Close()
-
 	ctx := context.Background()
 	topic := "test_topic"
 	partitionKey := "part1"
 	offset := int64(150)
+	token := partitionLeaseToken{leasedBy: testSubscriberName, generation: 1}
+	guardArgs := []driver.Value{testTenant, testConsumerGroup, topic, partitionKey, testSubscriberName, int64(1)}
 
-	mock.ExpectExec("UPDATE queue_offsets").
-		WithArgs(offset, sqlmock.AnyArg(), testTenant, topic, partitionKey, testConsumerGroup, offset).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	tests := []struct {
+		name       string
+		setup      func(mock sqlmock.Sqlmock)
+		wantErr    bool
+		wantFenced bool
+	}{
+		{
+			name: "advances the watermark as current owner",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectExec("UPDATE queue_offsets").
+					WithArgs(append([]driver.Value{offset, sqlmock.AnyArg(), testTenant, topic, partitionKey, testConsumerGroup, offset}, guardArgs...)...).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			},
+		},
+		{
+			name: "zero rows while lease lost returns ErrLeaseFenced",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectExec("UPDATE queue_offsets").
+					WithArgs(append([]driver.Value{offset, sqlmock.AnyArg(), testTenant, topic, partitionKey, testConsumerGroup, offset}, guardArgs...)...).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+					WithArgs(guardArgs...).
+					WillReturnRows(sqlmock.NewRows([]string{"1"}))
+			},
+			wantFenced: true,
+		},
+		{
+			name: "zero rows while still owned is a no-op",
+			setup: func(mock sqlmock.Sqlmock) {
+				mock.ExpectExec("UPDATE queue_offsets").
+					WithArgs(append([]driver.Value{offset, sqlmock.AnyArg(), testTenant, topic, partitionKey, testConsumerGroup, offset}, guardArgs...)...).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+					WithArgs(guardArgs...).
+					WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+			},
+		},
+	}
 
-	err := store.UpdateAckedOffset(ctx, testTenant, topic, partitionKey, offset, testConsumerGroup)
-	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, store := setupoffsetStoreTest(t)
+			defer db.Close()
+			tt.setup(mock)
+
+			err := store.UpdateAckedOffset(ctx, token, testTenant, topic, partitionKey, offset, testConsumerGroup)
+			switch {
+			case tt.wantFenced:
+				var fenced *ErrLeaseFenced
+				require.ErrorAs(t, err, &fenced)
+			case tt.wantErr:
+				require.Error(t, err)
+			default:
+				require.NoError(t, err)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 func TestOffsetStore_GetMinAckedOffset(t *testing.T) {

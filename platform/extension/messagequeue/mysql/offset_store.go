@@ -84,8 +84,12 @@ func (s *sqloffsetStore) GetAckedOffset(ctx context.Context, tenant string, topi
 	return offset, nil
 }
 
-// UpdateAckedOffset updates the offset_acked for a tenant+topic+partition (only if new offset is greater)
-func (s *sqloffsetStore) UpdateAckedOffset(ctx context.Context, tenant string, topic string, partitionKey string, offset int64, consumerGroup string) (retErr error) {
+// UpdateAckedOffset updates the offset_acked for a tenant+topic+partition (only
+// if new offset is greater). The write is conditioned on the caller's lease
+// token: a stale owner (partition stolen between watermark compute and write)
+// matches no rows and gets ErrLeaseFenced, so it can never move another
+// owner's watermark.
+func (s *sqloffsetStore) UpdateAckedOffset(ctx context.Context, token partitionLeaseToken, tenant string, topic string, partitionKey string, offset int64, consumerGroup string) (retErr error) {
 	op := metrics.Begin(s.scope, "update_acked_offset", metrics.StorageLatencyBuckets,
 		metrics.NewTag("topic", topic),
 		metrics.NewTag("consumer_group", consumerGroup))
@@ -93,14 +97,29 @@ func (s *sqloffsetStore) UpdateAckedOffset(ctx context.Context, tenant string, t
 
 	now := time.Now().UnixMilli()
 
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s
 		SET offset_acked = ?, updated_at = ?
-		WHERE tenant = ? AND topic = ? AND partition_key = ? AND consumer_group = ? AND offset_acked < ?
-	`, OffsetsTableName), offset, now, tenant, topic, partitionKey, consumerGroup, offset)
+		WHERE tenant = ? AND topic = ? AND partition_key = ? AND consumer_group = ? AND offset_acked < ? AND %s
+	`, OffsetsTableName, leaseGuardSQL),
+		append([]any{offset, now, tenant, topic, partitionKey, consumerGroup, offset},
+			leaseGuardArgs(token, tenant, consumerGroup, topic, partitionKey)...)...)
 
 	if err != nil {
 		return fmt.Errorf("update acked offset tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
+	}
+
+	if rows, raErr := result.RowsAffected(); raErr == nil && rows == 0 {
+		owned, ownErr := leaseStillOwned(ctx, s.db, token, tenant, consumerGroup, topic, partitionKey)
+		if ownErr != nil {
+			return fmt.Errorf("recheck lease ownership tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, ownErr)
+		}
+		if !owned {
+			return fmt.Errorf("update acked offset tenant=%s topic=%s partition=%s: %w",
+				tenant, topic, partitionKey,
+				fencedWriteError(token, tenant, topic, partitionKey))
+		}
+		// Still the owner: another tick already advanced to this value.
 	}
 
 	return nil

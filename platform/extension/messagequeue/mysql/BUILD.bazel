@@ -8,6 +8,7 @@ go_library(
         "errors.go",
         "identifier.go",
         "inlist.go",
+        "lease_guard.go",
         "message_store.go",
         "mock_stores.go",
         "offset_store.go",

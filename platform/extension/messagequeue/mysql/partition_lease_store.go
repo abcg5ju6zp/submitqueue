@@ -41,39 +41,46 @@ func newPartitionLeaseStore(db *sql.DB, logger *zap.SugaredLogger, scope tally.S
 	}
 }
 
-// TryAcquireLease attempts to acquire or renew a lease for a partition
-func (s *sqlpartitionLeaseStore) TryAcquireLease(ctx context.Context, tenant string, topic string, partitionKey string, subscriberName string, consumerGroup string, leaseDurationMs int64) (_ bool, retErr error) {
+// TryAcquireLease attempts to acquire or renew a lease for a partition.
+// Returns (acquired, generation): acquired is false when a non-stale lease is
+// held by another subscriber; generation is the row's current fencing epoch.
+func (s *sqlpartitionLeaseStore) TryAcquireLease(ctx context.Context, tenant string, topic string, partitionKey string, subscriberName string, consumerGroup string, leaseDurationMs int64) (_ bool, _ int64, retErr error) {
 	op := metrics.Begin(s.scope, "try_acquire_lease", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
 	defer func() { op.Complete(retErr) }()
 
 	now := currentTimeMillis()
 	staleThreshold := now - leaseDurationMs
 
-	// Try to insert or update stale lease
+	// Insert or steal a stale lease. Assignment order matters: lease_generation
+	// is evaluated first against the old row (old leased_by, old renewed_at),
+	// and only the stale-and-different-owner case increments the epoch. The
+	// ownership/timestamp assignments that follow then use the old values too.
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (tenant, consumer_group, topic, partition_key, leased_by, leased_at, lease_renewed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO %s (tenant, consumer_group, topic, partition_key, leased_by, leased_at, lease_renewed_at, lease_generation)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1)
 		ON DUPLICATE KEY UPDATE
+			lease_generation = IF(lease_renewed_at < ? AND leased_by <> VALUES(leased_by), lease_generation + 1, lease_generation),
 			leased_by = IF(lease_renewed_at < ?, VALUES(leased_by), leased_by),
 			leased_at = IF(lease_renewed_at < ?, VALUES(leased_at), leased_at),
 			lease_renewed_at = IF(lease_renewed_at < ?, VALUES(lease_renewed_at), lease_renewed_at)
 	`, PartitionLeasesTableName),
 		tenant, consumerGroup, topic, partitionKey, subscriberName, now, now,
-		staleThreshold, staleThreshold, staleThreshold)
+		staleThreshold, staleThreshold, staleThreshold, staleThreshold)
 
 	if err != nil {
-		return false, fmt.Errorf("acquire lease tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
+		return false, 0, fmt.Errorf("acquire lease tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
 	}
 
-	// Check if we own the lease
+	// Read back the owner and its fencing generation.
 	var owner string
+	var generation int64
 	err = s.db.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT leased_by FROM %s
+		SELECT leased_by, lease_generation FROM %s
 		WHERE tenant = ? AND consumer_group = ? AND topic = ? AND partition_key = ?
-	`, PartitionLeasesTableName), tenant, consumerGroup, topic, partitionKey).Scan(&owner)
+	`, PartitionLeasesTableName), tenant, consumerGroup, topic, partitionKey).Scan(&owner, &generation)
 
 	if err != nil {
-		return false, fmt.Errorf("check lease ownership tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
+		return false, 0, fmt.Errorf("check lease ownership tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
 	}
 
 	acquired := owner == subscriberName
@@ -83,23 +90,66 @@ func (s *sqlpartitionLeaseStore) TryAcquireLease(ctx context.Context, tenant str
 			logTenant, tenant,
 			logTopic, topic,
 			logPartitionKey, partitionKey,
+			"lease_generation", generation,
 		)
 	} else {
 		metrics.NamedCounter(s.scope, "try_acquire_lease", "not_acquired", 1, metrics.NewTag("topic", topic))
 	}
 
-	return acquired, nil
+	return acquired, generation, nil
 }
 
-// ReleaseLease releases the lease for a partition owned by this worker
-func (s *sqlpartitionLeaseStore) ReleaseLease(ctx context.Context, tenant string, topic string, partitionKey string, subscriberName string, consumerGroup string) (_ int64, retErr error) {
+// RenewLease refreshes one partition's lease, conditioned on the fencing token.
+// Returns false (without error) when the row no longer matches (subscriberName,
+// generation) — the lease was stolen, released, or purged and the caller must
+// fence its worker.
+func (s *sqlpartitionLeaseStore) RenewLease(ctx context.Context, tenant string, topic string, partitionKey string, subscriberName string, consumerGroup string, generation int64) (_ bool, retErr error) {
+	op := metrics.Begin(s.scope, "renew_lease", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
+	defer func() { op.Complete(retErr) }()
+
+	now := currentTimeMillis()
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %s
+		SET lease_renewed_at = ?
+		WHERE tenant = ? AND consumer_group = ? AND topic = ? AND partition_key = ? AND leased_by = ? AND lease_generation = ?
+	`, PartitionLeasesTableName), now, tenant, consumerGroup, topic, partitionKey, subscriberName, generation)
+	if err != nil {
+		return false, fmt.Errorf("renew lease tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		// Driver-level diagnostic failure: the UPDATE succeeded, ownership is
+		// not proven lost, so treat as renewed and let the next tick reconcile.
+		s.logger.Warnw("failed to get rows affected after renew lease",
+			logTopic, topic,
+			logError, err,
+		)
+		return true, nil
+	}
+	if rows == 0 {
+		s.logger.Infow("lease lost on renewal",
+			logTenant, tenant,
+			logTopic, topic,
+			logPartitionKey, partitionKey,
+			logLeasedBy, subscriberName,
+			"lease_generation", generation,
+		)
+		return false, nil
+	}
+	return true, nil
+}
+
+// ReleaseLease releases the lease for a partition owned by this subscriber at
+// exactly generation. A generation mismatch (the partition was stolen and
+// re-acquired) deletes zero rows.
+func (s *sqlpartitionLeaseStore) ReleaseLease(ctx context.Context, tenant string, topic string, partitionKey string, subscriberName string, consumerGroup string, generation int64) (_ int64, retErr error) {
 	op := metrics.Begin(s.scope, "release_lease", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
 	defer func() { op.Complete(retErr) }()
 
 	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		DELETE FROM %s
-		WHERE tenant = ? AND consumer_group = ? AND topic = ? AND partition_key = ? AND leased_by = ?
-	`, PartitionLeasesTableName), tenant, consumerGroup, topic, partitionKey, subscriberName)
+		WHERE tenant = ? AND consumer_group = ? AND topic = ? AND partition_key = ? AND leased_by = ? AND lease_generation = ?
+	`, PartitionLeasesTableName), tenant, consumerGroup, topic, partitionKey, subscriberName, generation)
 
 	if err != nil {
 		return 0, fmt.Errorf("release lease tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
@@ -129,19 +179,19 @@ func (s *sqlpartitionLeaseStore) ReleaseLease(ctx context.Context, tenant string
 	return rows, nil
 }
 
-func (s *sqlpartitionLeaseStore) GetLeasedPartitionsForTenants(ctx context.Context, tenants []string, topic string, subscriberName string, consumerGroup string) (_ map[string][]string, retErr error) {
+func (s *sqlpartitionLeaseStore) GetLeasedPartitionsForTenants(ctx context.Context, tenants []string, topic string, subscriberName string, consumerGroup string) (_ map[string][]leaseInfo, retErr error) {
 	op := metrics.Begin(s.scope, "get_leased_partitions_for_tenants", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
 	defer func() { op.Complete(retErr) }()
 
 	placeholders, ok := inListPlaceholders(len(tenants))
 	if !ok {
-		return map[string][]string{}, nil
+		return map[string][]leaseInfo{}, nil
 	}
 	args := appendStrings(nil, tenants)
 	args = append(args, consumerGroup, topic, subscriberName)
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT tenant, partition_key FROM %s
+		SELECT tenant, partition_key, lease_generation FROM %s
 		WHERE tenant IN (%s) AND consumer_group = ? AND topic = ? AND leased_by = ?
 	`, PartitionLeasesTableName, placeholders), args...)
 	if err != nil {
@@ -149,13 +199,15 @@ func (s *sqlpartitionLeaseStore) GetLeasedPartitionsForTenants(ctx context.Conte
 	}
 	defer rows.Close()
 
-	byTenant := make(map[string][]string)
+	byTenant := make(map[string][]leaseInfo)
 	for rows.Next() {
-		var tenant, partition string
-		if err := rows.Scan(&tenant, &partition); err != nil {
+		var tenantName string
+		var lease leaseInfo
+		if err := rows.Scan(&tenantName, &lease.PartitionKey, &lease.Generation); err != nil {
 			return nil, fmt.Errorf("scan leased partition topic=%s: %w", topic, err)
 		}
-		byTenant[tenant] = append(byTenant[tenant], partition)
+		lease.LeasedBy = subscriberName
+		byTenant[tenantName] = append(byTenant[tenantName], lease)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("row iteration topic=%s: %w", topic, err)
@@ -175,7 +227,7 @@ func (s *sqlpartitionLeaseStore) GetAllLeasesForTenants(ctx context.Context, ten
 	args = append(args, consumerGroup, topic)
 
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT tenant, partition_key, leased_by, lease_renewed_at FROM %s
+		SELECT tenant, partition_key, leased_by, lease_generation, lease_renewed_at FROM %s
 		WHERE tenant IN (%s) AND consumer_group = ? AND topic = ?
 	`, PartitionLeasesTableName, placeholders), args...)
 	if err != nil {
@@ -187,7 +239,7 @@ func (s *sqlpartitionLeaseStore) GetAllLeasesForTenants(ctx context.Context, ten
 	for rows.Next() {
 		var tenant string
 		var lease leaseInfo
-		if err := rows.Scan(&tenant, &lease.PartitionKey, &lease.LeasedBy, &lease.LeaseRenewedAt); err != nil {
+		if err := rows.Scan(&tenant, &lease.PartitionKey, &lease.LeasedBy, &lease.Generation, &lease.LeaseRenewedAt); err != nil {
 			return nil, fmt.Errorf("scan lease topic=%s: %w", topic, err)
 		}
 		byTenant[tenant] = append(byTenant[tenant], lease)
@@ -198,65 +250,18 @@ func (s *sqlpartitionLeaseStore) GetAllLeasesForTenants(ctx context.Context, ten
 	return byTenant, nil
 }
 
-func (s *sqlpartitionLeaseStore) RenewOwnedLeases(ctx context.Context, tenants []string, topic string, subscriberName string, consumerGroup string) (_ int64, retErr error) {
-	op := metrics.Begin(s.scope, "renew_owned_leases", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
+// CheckLeaseOwnership reports whether the partition lease currently matches
+// token. The guarded writes are authoritative; this is the poll-time fast
+// path that stops a fenced worker from even claiming new visibility.
+func (s *sqlpartitionLeaseStore) CheckLeaseOwnership(ctx context.Context, token partitionLeaseToken, tenant string, topic string, partitionKey string, consumerGroup string) (_ bool, retErr error) {
+	op := metrics.Begin(s.scope, "check_lease_ownership", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
 	defer func() { op.Complete(retErr) }()
 
-	placeholders, ok := inListPlaceholders(len(tenants))
-	if !ok {
-		return 0, nil
-	}
-	now := currentTimeMillis()
-	args := []any{now}
-	args = appendStrings(args, tenants)
-	args = append(args, consumerGroup, topic, subscriberName)
-
-	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %s
-		SET lease_renewed_at = ?
-		WHERE tenant IN (%s) AND consumer_group = ? AND topic = ? AND leased_by = ?
-	`, PartitionLeasesTableName, placeholders), args...)
+	owned, err := leaseStillOwned(ctx, s.db, token, tenant, consumerGroup, topic, partitionKey)
 	if err != nil {
-		return 0, fmt.Errorf("renew owned leases topic=%s: %w", topic, err)
+		return false, fmt.Errorf("check lease ownership tenant=%s topic=%s partition=%s: %w", tenant, topic, partitionKey, err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		s.logger.Warnw("failed to get rows affected after renew owned leases",
-			logTopic, topic,
-			logError, err,
-		)
-		return 0, nil
-	}
-	return rows, nil
-}
-
-func (s *sqlpartitionLeaseStore) ReleaseOwnedLeases(ctx context.Context, tenants []string, topic string, subscriberName string, consumerGroup string) (_ int64, retErr error) {
-	op := metrics.Begin(s.scope, "release_owned_leases", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
-	defer func() { op.Complete(retErr) }()
-
-	placeholders, ok := inListPlaceholders(len(tenants))
-	if !ok {
-		return 0, nil
-	}
-	args := appendStrings(nil, tenants)
-	args = append(args, consumerGroup, topic, subscriberName)
-
-	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM %s
-		WHERE tenant IN (%s) AND consumer_group = ? AND topic = ? AND leased_by = ?
-	`, PartitionLeasesTableName, placeholders), args...)
-	if err != nil {
-		return 0, fmt.Errorf("release owned leases topic=%s: %w", topic, err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		s.logger.Warnw("failed to get rows affected after release owned leases",
-			logTopic, topic,
-			logError, err,
-		)
-		return 0, nil
-	}
-	return rows, nil
+	return owned, nil
 }
 
 func (s *sqlpartitionLeaseStore) PurgeStaleForTenants(ctx context.Context, tenants []string, topic string, consumerGroup string, olderThanMs int64) (retErr error) {

@@ -34,9 +34,14 @@ import (
 )
 
 const (
-	// leaseReleaseTimeout is the timeout for releasing partition leases during
-	// shutdown. Uses a fresh context since the subscription context is cancelled.
+	// leaseReleaseTimeout bounds the post-drain cleanup (watermark commit,
+	// lease release, heartbeat deregistration). It runs on a fresh context
+	// because the subscription context is already cancelled on shutdown.
 	leaseReleaseTimeout = 30 * time.Second
+
+	// workerShutdownGrace bounds how long the drain waits for already-canceled
+	// worker goroutines to exit before the rest of the cleanup proceeds.
+	workerShutdownGrace = 5 * time.Second
 
 	// subscriptionShutdownTimeout is the maximum time to wait for the
 	// managePartitions goroutine to finish during Close().
@@ -163,6 +168,113 @@ type subscription struct {
 	// partition keys don't hold leases, offset rows, and polling workers forever.
 	// Only accessed by the single managePartitions goroutine — no locking needed.
 	drainedSince map[entityqueue.PartitionIdentity]time.Time
+
+	// Outstanding deliveries handed out since the last terminal outcome,
+	// tracked for the ordered shutdown drain. A delivery is removed once its
+	// terminal write (ack/nack/postpone/reject) succeeds, or once its
+	// visibility deadline becomes safe to wait out.
+	outstandingMu sync.Mutex
+	outstanding   map[*sqlDelivery]int64 // delivery -> visibility deadline (unix ms)
+	// settleEvents is signalled (non-blocking) whenever an outstanding
+	// delivery is settled or its deadline extended.
+	settleEvents chan struct{}
+
+	// drain state. beginDrain is run at most once (ctx cancel, explicit
+	// ShutdownSubscription, or Close); every trigger joins the same run.
+	drainOnce  sync.Once
+	drainStart chan struct{}
+	drainDone  chan struct{}
+	drainErr   error
+}
+
+// trackOutstanding records a delivery handed to the framework and its
+// visibility deadline. No-op once draining started.
+func (sub *subscription) trackOutstanding(d *sqlDelivery) {
+	sub.outstandingMu.Lock()
+	defer sub.outstandingMu.Unlock()
+	if sub.isDrainingLocked() {
+		return
+	}
+	if sub.outstanding == nil {
+		sub.outstanding = make(map[*sqlDelivery]int64)
+	}
+	sub.outstanding[d] = time.Now().UnixMilli() + sub.config.VisibilityTimeoutMs
+}
+
+// settleOutstanding removes a delivery after its terminal write succeeded.
+func (sub *subscription) settleOutstanding(d *sqlDelivery) {
+	sub.outstandingMu.Lock()
+	delete(sub.outstanding, d)
+	sub.outstandingMu.Unlock()
+	sub.signalSettlement()
+}
+
+// extendOutstanding pushes out the visibility deadline of an in-flight delivery.
+func (sub *subscription) extendOutstanding(d *sqlDelivery, durationMillis int64) {
+	sub.outstandingMu.Lock()
+	if _, ok := sub.outstanding[d]; ok {
+		sub.outstanding[d] = time.Now().UnixMilli() + durationMillis
+	}
+	sub.outstandingMu.Unlock()
+	sub.signalSettlement()
+}
+
+func (sub *subscription) signalSettlement() {
+	select {
+	case sub.settleEvents <- struct{}{}:
+	default:
+	}
+}
+
+// isDraining reports whether the ordered shutdown drain has begun.
+func (sub *subscription) isDraining() bool {
+	sub.outstandingMu.Lock()
+	defer sub.outstandingMu.Unlock()
+	return sub.isDrainingLocked()
+}
+
+func (sub *subscription) isDrainingLocked() bool {
+	select {
+	case <-sub.drainStart:
+		return true
+	default:
+		return false
+	}
+}
+
+// drainWait returns the partitions still waiting on outstanding deliveries and
+// the time until every such delivery has settled or become visible again (the
+// latest unexpired visibility deadline). A delivery whose visibility already
+// lapsed is not counted: this subscriber stopped claiming, so the redelivery
+// is safely owned by whoever acquires the partition next. Pending zero means
+// fully drained.
+func (sub *subscription) drainWait(now time.Time) (partitions map[entityqueue.PartitionIdentity]int64, safeWait time.Duration, pending int) {
+	sub.outstandingMu.Lock()
+	defer sub.outstandingMu.Unlock()
+	if len(sub.outstanding) == 0 {
+		return nil, 0, 0
+	}
+	nowMs := now.UnixMilli()
+	partitions = make(map[entityqueue.PartitionIdentity]int64)
+	var latest int64
+	for d, invisibleUntil := range sub.outstanding {
+		if invisibleUntil <= nowMs {
+			continue
+		}
+		pending++
+		id := entityqueue.PartitionIdentity{Tenant: d.tenant, PartitionKey: d.partitionKey}
+		if existing, ok := partitions[id]; !ok || d.token.generation < existing {
+			partitions[id] = d.token.generation
+		}
+		if invisibleUntil > latest {
+			latest = invisibleUntil
+		}
+	}
+	if pending == 0 {
+		return nil, 0, 0
+	}
+	safeWait = time.Duration(latest-nowMs) * time.Millisecond
+	return partitions, max(safeWait, 0), pending
 }
 
 func partitionKeysForTenant(partitions []entityqueue.PartitionIdentity, tenant string) []string {
@@ -192,6 +304,11 @@ type partitionWorker struct {
 	partitionKey string
 	sub          *subscription
 	subscriber   *subscriber
+	// generation is the fencing epoch captured from the lease row when the
+	// worker started. Every owner-scoped write this worker (and the
+	// deliveries it hands out) makes carries (SubscriberName, generation);
+	// after a steal, the stale token's writes are rejected server-side.
+	generation int64
 	// cancelFunc cancels this worker's context, causing run() to exit.
 	cancelFunc context.CancelFunc
 	// done is closed when run() returns, signaling the worker has fully stopped.
@@ -239,6 +356,12 @@ type sqlDelivery struct {
 	// Track acknowledgment state
 	mu           sync.Mutex
 	acknowledged bool
+
+	// token is the lease fencing identity every terminal write carries.
+	token partitionLeaseToken
+	// sub is the owning subscription, used to settle the outstanding-delivery
+	// drain tracking once a terminal write succeeds.
+	sub *subscription
 }
 
 func newSQLDelivery(
@@ -247,6 +370,8 @@ func newSQLDelivery(
 	attempt int,
 	metadata map[string]string,
 	subscriber *subscriber,
+	sub *subscription,
+	token partitionLeaseToken,
 	tenant string,
 	topic string,
 	partitionKey string,
@@ -265,6 +390,8 @@ func newSQLDelivery(
 		receivedAt:    time.Now().UnixMilli(),
 		metadata:      metadata,
 		subscriber:    subscriber,
+		sub:           sub,
+		token:         token,
 		tenant:        tenant,
 		topic:         topic,
 		partitionKey:  partitionKey,
@@ -316,11 +443,14 @@ func (d *sqlDelivery) Ack(ctx context.Context) error {
 	// Mark as acked in delivery state (per consumer group).
 	// Watermark advancement is deferred to the poll loop to reduce per-ack
 	// latency from 4-5 DB round trips to 1.
-	if err := d.subscriber.deliveryStateStore.MarkAcked(ctx, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset); err != nil {
+	if err := d.subscriber.deliveryStateStore.MarkAcked(ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset); err != nil {
 		return err
 	}
 
 	d.acknowledged = true
+	if d.sub != nil {
+		d.sub.settleOutstanding(d)
+	}
 	return nil
 }
 
@@ -358,7 +488,7 @@ func (d *sqlDelivery) Nack(ctx context.Context, f failure.Failure) error {
 	}
 
 	retryDelayMs := retryBackoffMs(d.retry, d.attempt)
-	if err := d.subscriber.deliveryStateStore.MarkNacked(ctx, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, retryDelayMs); err != nil {
+	if err := d.subscriber.deliveryStateStore.MarkNacked(ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, retryDelayMs); err != nil {
 		return err
 	}
 
@@ -370,6 +500,9 @@ func (d *sqlDelivery) Nack(ctx context.Context, f failure.Failure) error {
 	)
 
 	d.acknowledged = true
+	if d.sub != nil {
+		d.sub.settleOutstanding(d)
+	}
 	return nil
 }
 
@@ -384,7 +517,7 @@ func (d *sqlDelivery) Postpone(ctx context.Context, delayMs int64) error {
 
 	// Mark as postponed in delivery state (per consumer group): invisible for
 	// the delay, retry_count reset, partition barrier until redelivery.
-	if err := d.subscriber.deliveryStateStore.MarkPostponed(ctx, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, delayMs); err != nil {
+	if err := d.subscriber.deliveryStateStore.MarkPostponed(ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, delayMs); err != nil {
 		return err
 	}
 
@@ -396,6 +529,9 @@ func (d *sqlDelivery) Postpone(ctx context.Context, delayMs int64) error {
 	)
 
 	d.acknowledged = true
+	if d.sub != nil {
+		d.sub.settleOutstanding(d)
+	}
 	return nil
 }
 
@@ -418,21 +554,22 @@ func (d *sqlDelivery) Reject(ctx context.Context, f failure.Failure) error {
 // Callers hold d.mu.
 func (d *sqlDelivery) deadLetter(ctx context.Context, f failure.Failure) error {
 	if d.dlqConfig.Enabled {
-		// Move to DLQ
-		if err := d.subscriber.messageStore.MoveToDLQ(
-			ctx, d.tenant, d.topic, d.partitionKey, d.messageID, d.attempt, f, d.dlqConfig.TopicSuffix,
+		// One transaction moves the row to the DLQ topic and marks delivery
+		// state acked, conditioned on the lease fencing token.
+		if err := d.subscriber.messageStore.MoveToDLQAndAck(
+			ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.messageID, d.attempt, f, d.dlqConfig.TopicSuffix,
 		); err != nil {
-			return fmt.Errorf("failed to move message to DLQ: %w", err)
+			return fmt.Errorf("failed to move message to DLQ and ack: %w", err)
 		}
-	}
-
-	// Mark as acked in delivery state. Watermark advancement is deferred
-	// to the poll loop, same as Ack.
-	if err := d.subscriber.deliveryStateStore.MarkAcked(ctx, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset); err != nil {
-		return fmt.Errorf("mark acked after DLQ move: %w", err)
+	} else if err := d.subscriber.deliveryStateStore.MarkAcked(ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset); err != nil {
+		// DLQ disabled: ack-and-drop, still fenced by the lease token.
+		return fmt.Errorf("mark acked: %w", err)
 	}
 
 	d.acknowledged = true
+	if d.sub != nil {
+		d.sub.settleOutstanding(d)
+	}
 	return nil
 }
 
@@ -451,8 +588,11 @@ func (d *sqlDelivery) ExtendVisibilityTimeout(ctx context.Context, durationMilli
 	}
 
 	// Extend visibility without incrementing retry_count
-	if err := d.subscriber.deliveryStateStore.ExtendVisibility(ctx, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, durationMillis); err != nil {
+	if err := d.subscriber.deliveryStateStore.ExtendVisibility(ctx, d.token, d.consumerGroup, d.tenant, d.topic, d.partitionKey, d.offset, durationMillis); err != nil {
 		return err
+	}
+	if d.sub != nil {
+		d.sub.extendOutstanding(d, durationMillis)
 	}
 
 	return nil
@@ -484,8 +624,10 @@ func (s *subscriber) emitSignal(sig HookSignal) {
 
 // advanceWatermark advances offset_acked to the highest contiguous acked offset.
 // All operations are idempotent — safe to call from multiple paths (Reject, retry-limit,
-// poll loop) and safe to retry on failure.
-func (s *subscriber) advanceWatermark(ctx context.Context, tenant, consumerGroup, topic, partitionKey string) error {
+// poll loop) and safe to retry on failure. The writes carry the worker's lease
+// token; a fenced owner skips advancement and leaves the watermark for the new
+// owner's next tick.
+func (s *subscriber) advanceWatermark(ctx context.Context, token partitionLeaseToken, tenant, consumerGroup, topic, partitionKey string) error {
 	currentOffset, err := s.offsetStore.GetAckedOffset(ctx, tenant, topic, partitionKey, consumerGroup)
 	if err != nil {
 		return fmt.Errorf("get acked offset for watermark advance: %w", err)
@@ -496,13 +638,17 @@ func (s *subscriber) advanceWatermark(ctx context.Context, tenant, consumerGroup
 		return fmt.Errorf("get message offsets for watermark advance: %w", err)
 	}
 
-	newWatermark, err := s.deliveryStateStore.AdvanceWatermark(ctx, consumerGroup, tenant, topic, partitionKey, currentOffset, offsets)
+	newWatermark, err := s.deliveryStateStore.AdvanceWatermark(ctx, token, consumerGroup, tenant, topic, partitionKey, currentOffset, offsets)
 	if err != nil {
 		return fmt.Errorf("advance watermark: %w", err)
 	}
 
 	if newWatermark > currentOffset {
-		if err := s.offsetStore.UpdateAckedOffset(ctx, tenant, topic, partitionKey, newWatermark, consumerGroup); err != nil {
+		if err := s.offsetStore.UpdateAckedOffset(ctx, token, tenant, topic, partitionKey, newWatermark, consumerGroup); err != nil {
+			var fenced *ErrLeaseFenced
+			if errors.As(err, &fenced) {
+				return nil
+			}
 			return fmt.Errorf("update acked offset after watermark advance: %w", err)
 		}
 	}
@@ -554,18 +700,32 @@ func (s *subscriber) Subscribe(ctx context.Context, topic string, config extqueu
 
 	subKey := topic + ":" + config.ConsumerGroup
 
-	// A subscription whose supervisor already exited (its ctx was cancelled
-	// without Close, which would have cleared the map) has a closed
-	// deliveryCh. Evicting it here and falling through to build a fresh one
-	// keeps that closed channel from being handed to the next caller.
-	if sub, exists := s.subscriptions[subKey]; exists {
+	// A subscription whose drain finished (its ctx was cancelled without
+	// Close, which would have cleared the map) has a closed drainDone.
+	// Evicting it here and falling through to build a fresh one keeps the
+	// closed channel from being handed to the next caller; drainDone closes
+	// deterministically at end of drain regardless of supervisor scheduling.
+	if sub, exists := s.subscriptions[subKey]; exists && sub.drainDone != nil {
+		// Stale once the drain finished or the delivery channel closed
+		// (channel close is the synchronization point callers already use).
+		stale := false
 		select {
-		case <-sub.done:
-			delete(s.subscriptions, subKey)
+		case <-sub.drainDone:
+			stale = true
 		default:
+			if sub.deliveryCh != nil {
+				select {
+				case <-sub.deliveryCh:
+					stale = true
+				default:
+				}
+			}
+		}
+		if !stale {
 			s.logger.Debugw("reusing existing subscription", "topic", topic, "consumer_group", config.ConsumerGroup)
 			return sub.deliveryCh, nil
 		}
+		delete(s.subscriptions, subKey)
 	}
 
 	s.logger.Infow("creating new subscription",
@@ -581,12 +741,17 @@ func (s *subscriber) Subscribe(ctx context.Context, topic string, config extqueu
 	// effective for a caller whose ctx never completes.
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &subscription{
-		topic:      topic,
-		config:     config,
-		deliveryCh: make(chan extqueue.Delivery, config.BatchSize*2),
-		cancelFunc: cancel,
-		done:       make(chan struct{}),
-		workers:    make(map[entityqueue.PartitionIdentity]*partitionWorker),
+		topic:        topic,
+		config:       config,
+		deliveryCh:   make(chan extqueue.Delivery, config.BatchSize*2),
+		cancelFunc:   cancel,
+		done:         make(chan struct{}),
+		settleEvents: make(chan struct{}, 1),
+		drainStart:   make(chan struct{}),
+		drainDone:    make(chan struct{}),
+		workers:      make(map[entityqueue.PartitionIdentity]*partitionWorker),
+		outstanding:  make(map[*sqlDelivery]int64),
+		drainedSince: make(map[entityqueue.PartitionIdentity]time.Time),
 	}
 
 	s.subscriptions[subKey] = sub
@@ -614,16 +779,20 @@ func (s *subscriber) Subscribe(ctx context.Context, topic string, config extqueu
 //	  +-- partitionWorker("part-2")
 //	  +-- partitionWorker("part-N")
 //
-// Shutdown sequence (triggered by ctx cancellation):
-//  1. stopAllWorkers: cancels each worker's context and removes from map
-//  2. releaseAllLeases: releases DB partition leases (fresh context, not cancelled)
-//  3. workerWg.Wait(): blocks until all workers have fully exited -- this ensures
-//     no worker can send on deliveryCh after step 4
-//  4. close(deliveryCh): safe because step 3 guarantees no senders remain
-//  5. managePartitions returns -> done closes -> Close() unblocks
+// Shutdown sequence (triggered by ctx cancellation, explicit
+// ShutdownSubscription, or Close — all converge on one drain run):
+//  1. beginShutdown closes drainStart and cancels the subscription context,
+//     stopping discovery, renewal, rebalance, and new message claims.
+//  2. waitOutstanding blocks while in-flight deliveries settle (ack/nack/
+//     postpone/reject) or until their visibility deadlines are safely past,
+//     bounded by the drain deadline.
+//  3. workers fully exit (workerWg), then each fully-drained partition gets a
+//     final watermark commit and a generation-guarded lease release;
+//     partitions still outstanding keep their leases for takeover.
+//  4. heartbeat deregisters, deliveryCh closes, and drainDone signals joiners.
 func (s *subscriber) managePartitions(ctx context.Context, sub *subscription) {
 	// Deferred so every exit path marks the subscription stale for Subscribe.
-	// Must not take s.subMu: Close holds it across cancelFunc()+wg.Wait() for
+	// Must not take s.subMu: Close holds it across cancelFunc()+wait for
 	// every subscription, so locking here would deadlock against the very
 	// Close that triggered this shutdown.
 	defer close(sub.done)
@@ -665,24 +834,13 @@ func (s *subscriber) managePartitions(ctx context.Context, sub *subscription) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.stopAllWorkers(sub)
-			// Release all leases on shutdown with a fresh context
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
-			defer cancel()
-
-			// Best-effort shutdown cleanup — log errors but don't block shutdown.
-			// Leases expire naturally after LeaseDurationMs if release fails.
-			// Heartbeat becomes stale after the same duration.
-			if err := s.releaseAllLeases(cleanupCtx, sub); err != nil {
-				s.logger.Errorw("failed to release leases during shutdown", append(logFields, "error", err)...)
-			}
-			if err := s.deregisterHeartbeat(cleanupCtx, sub); err != nil {
-				s.logger.Errorw("failed to deregister heartbeat during shutdown", append(logFields, "error", err)...)
-			}
-
-			// Wait for all workers to fully exit, then close channel
-			sub.workerWg.Wait()
-			close(sub.deliveryCh)
+			// The drain deadline defaults to the subscriber-wide shutdown
+			// timeout when shutdown came from context cancellation rather
+			// than from an explicit ShutdownSubscription call.
+			drainCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+			s.beginShutdown(drainCtx, sub)
+			<-sub.drainDone
+			cancel()
 			return
 
 		case <-leaseTicker.C:
@@ -762,11 +920,11 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 			leased := leasedByTenant[tenant]
 			maxPartitions := 0
 			if !uncapped {
-				maxPartitions = s.fairShareCap(sub, leased, discovered, activeByTenant[tenant])
+				maxPartitions = s.fairShareCap(sub, leasePartitionKeys(leased), discovered, activeByTenant[tenant])
 			}
 			acquired := s.acquireUnownedPartitions(tickCtx, sub, tenant, discovered, allLeasesByTenant[tenant], maxPartitions)
 			if len(acquired) > 0 {
-				leasedByTenant[tenant] = append(append([]string{}, leased...), acquired...)
+				leasedByTenant[tenant] = append(append([]leaseInfo{}, leased...), acquired...)
 			}
 			s.observeOwnedPartitions(sub, tenant, len(leasedByTenant[tenant]))
 		}
@@ -774,14 +932,19 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 
 	allDiscovered := make([]entityqueue.PartitionIdentity, 0)
 	allLeased := make([]entityqueue.PartitionIdentity, 0)
+	ownedGenerations := make(map[entityqueue.PartitionIdentity]int64)
 	nextDrainedSince := make(map[entityqueue.PartitionIdentity]time.Time, len(sub.drainedSince))
 	grace := time.Duration(idleLeaseReleaseAfterLeaseDurations*cfg.LeaseDurationMs) * time.Millisecond
 	now := time.Now()
 	var expired []entityqueue.PartitionIdentity
+	leaseGeneration := make(map[entityqueue.PartitionIdentity]int64)
 
 	for _, tenant := range s.tenants {
 		discoveredPartitions := discoveredByTenant[tenant]
 		leasedPartitions := leasedByTenant[tenant]
+		for _, lease := range leasedPartitions {
+			leaseGeneration[entityqueue.PartitionIdentity{Tenant: tenant, PartitionKey: lease.PartitionKey}] = lease.Generation
+		}
 		tenantDiscovered := make([]entityqueue.PartitionIdentity, 0, len(discoveredPartitions))
 		for _, pk := range discoveredPartitions {
 			partition := entityqueue.PartitionIdentity{Tenant: tenant, PartitionKey: pk}
@@ -789,10 +952,11 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 			allDiscovered = append(allDiscovered, partition)
 		}
 		tenantLeased := make([]entityqueue.PartitionIdentity, 0, len(leasedPartitions))
-		for _, pk := range leasedPartitions {
-			partition := entityqueue.PartitionIdentity{Tenant: tenant, PartitionKey: pk}
+		for _, lease := range leasedPartitions {
+			partition := entityqueue.PartitionIdentity{Tenant: tenant, PartitionKey: lease.PartitionKey}
 			tenantLeased = append(tenantLeased, partition)
 			allLeased = append(allLeased, partition)
+			ownedGenerations[partition] = lease.Generation
 		}
 
 		previouslyDrained := make(map[entityqueue.PartitionIdentity]time.Time)
@@ -819,7 +983,7 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 		for _, partition := range expired {
 			tenant := partition.Tenant
 			pk := partition.PartitionKey
-			rows, err := s.leaseStore.ReleaseLease(ctx, tenant, sub.topic, pk, cfg.SubscriberName, cfg.ConsumerGroup)
+			rows, err := s.leaseStore.ReleaseLease(ctx, tenant, sub.topic, pk, cfg.SubscriberName, cfg.ConsumerGroup, leaseGeneration[partition])
 			if err != nil {
 				s.logger.Errorw("release lease for drained partition failed",
 					"tenant", tenant,
@@ -834,7 +998,7 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 			if rows > 0 {
 				s.recordLeaseReleased(sub, tenant, leaseReasonIdle, rows)
 				s.logger.Infow("released idle partition lease",
-					append(leaseLogFields(sub, tenant, pk), logReason, leaseReasonIdle)...,
+					append(leaseLogFields(sub, tenant, pk), logReason, leaseReasonIdle, "lease_generation", leaseGeneration[partition])...,
 				)
 			}
 
@@ -854,6 +1018,8 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 			for _, partition := range allLeased {
 				if _, ok := released[partition]; !ok {
 					kept = append(kept, partition)
+				} else {
+					delete(ownedGenerations, partition)
 				}
 			}
 			allLeased = kept
@@ -867,7 +1033,7 @@ func (s *subscriber) discoverAndReconcileWorkers(ctx context.Context, sub *subsc
 		}
 	}
 
-	s.reconcilePartitionWorkers(ctx, sub, allLeased)
+	s.reconcilePartitionWorkers(ctx, sub, ownedGenerations)
 	return skipAcquire
 }
 
@@ -877,7 +1043,18 @@ func (s *subscriber) keepCachedDiscovery(sub *subscription, cached []entityqueue
 	sub.workersMu.Unlock()
 }
 
-func (s *subscriber) acquireUnownedPartitions(ctx context.Context, sub *subscription, tenant string, discovered []string, leases []leaseInfo, maxPartitions int) []string {
+func leasePartitionKeys(leases []leaseInfo) []string {
+	if len(leases) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(leases))
+	for _, lease := range leases {
+		out = append(out, lease.PartitionKey)
+	}
+	return out
+}
+
+func (s *subscriber) acquireUnownedPartitions(ctx context.Context, sub *subscription, tenant string, discovered []string, leases []leaseInfo, maxPartitions int) []leaseInfo {
 	cfg := sub.config
 	staleThreshold := currentTimeMillis() - cfg.LeaseDurationMs
 	ownedCount := 0
@@ -896,7 +1073,7 @@ func (s *subscriber) acquireUnownedPartitions(ctx context.Context, sub *subscrip
 		}
 	}
 
-	var acquired []string
+	var acquired []leaseInfo
 	for _, partitionKey := range discovered {
 		if _, owned := ownedSet[partitionKey]; owned {
 			continue
@@ -907,7 +1084,7 @@ func (s *subscriber) acquireUnownedPartitions(ctx context.Context, sub *subscrip
 		if maxPartitions > 0 && ownedCount >= maxPartitions {
 			break
 		}
-		ok, err := s.leaseStore.TryAcquireLease(ctx, tenant, sub.topic, partitionKey, cfg.SubscriberName, cfg.ConsumerGroup, cfg.LeaseDurationMs)
+		ok, generation, err := s.leaseStore.TryAcquireLease(ctx, tenant, sub.topic, partitionKey, cfg.SubscriberName, cfg.ConsumerGroup, cfg.LeaseDurationMs)
 		if err != nil {
 			s.logger.Errorw("failed to acquire lease for partition",
 				append(leaseLogFields(sub, tenant, partitionKey), logError, err)...,
@@ -915,16 +1092,20 @@ func (s *subscriber) acquireUnownedPartitions(ctx context.Context, sub *subscrip
 			continue
 		}
 		if ok {
-			acquired = append(acquired, partitionKey)
+			acquired = append(acquired, leaseInfo{
+				PartitionKey: partitionKey,
+				LeasedBy:     cfg.SubscriberName,
+				Generation:   generation,
+			})
 			ownedCount++
 			if prior, stolen := previousOwner[partitionKey]; stolen && prior != "" && prior != cfg.SubscriberName {
 				s.recordLeaseCounter(sub, tenant, "stolen", 1)
 				s.logger.Infow("lease stolen",
-					append(leaseLogFields(sub, tenant, partitionKey), logPreviousOwner, prior)...,
+					append(leaseLogFields(sub, tenant, partitionKey), logPreviousOwner, prior, "lease_generation", generation)...,
 				)
 			} else {
 				s.recordLeaseCounter(sub, tenant, "acquired", 1)
-				s.logger.Debugw("lease acquired", leaseLogFields(sub, tenant, partitionKey)...)
+				s.logger.Debugw("lease acquired", append(leaseLogFields(sub, tenant, partitionKey), "lease_generation", generation)...)
 			}
 		}
 	}
@@ -1047,47 +1228,62 @@ func updateDrainedTracking(
 // snapshot of workers read under the lock does not change between unlock and the
 // subsequent start/stop calls. The lock is held briefly to read state, then
 // released before worker cancellation.
-func (s *subscriber) reconcilePartitionWorkers(ctx context.Context, sub *subscription, currentLeases []entityqueue.PartitionIdentity) {
-	leaseSet := make(map[entityqueue.PartitionIdentity]struct{}, len(currentLeases))
-	for _, partition := range currentLeases {
-		leaseSet[partition] = struct{}{}
-	}
-
+// reconcilePartitionWorkers diffs the current set of workers against the
+// current leases (partition → fencing generation) and starts/stops workers
+// to match. A worker whose generation no longer matches the lease is stopped
+// and replaced so its in-flight writes fail closed against the new owner.
+func (s *subscriber) reconcilePartitionWorkers(ctx context.Context, sub *subscription, leaseGenerations map[entityqueue.PartitionIdentity]int64) {
 	sub.workersMu.Lock()
 
-	// Find workers to stop (no longer leased)
+	// Find workers to stop (no longer leased, or leased at a new generation).
 	var toStop []entityqueue.PartitionIdentity
-	for partition := range sub.workers {
-		if _, ok := leaseSet[partition]; !ok {
+	for partition, worker := range sub.workers {
+		gen, ok := leaseGenerations[partition]
+		if !ok || worker.generation != gen {
 			toStop = append(toStop, partition)
 		}
 	}
 
-	// Find partitions to start (newly leased)
+	// Find partitions to start (no worker, or a generation change pending).
 	var toStart []entityqueue.PartitionIdentity
-	for _, partition := range currentLeases {
-		if _, ok := sub.workers[partition]; !ok {
+	for partition, gen := range leaseGenerations {
+		worker, ok := sub.workers[partition]
+		if !ok || worker.generation != gen {
 			toStart = append(toStart, partition)
 		}
 	}
 
 	sub.workersMu.Unlock()
 
-	// Stop workers for partitions no longer leased
+	// Stop workers for partitions no longer leased (or fenced).
 	for _, partition := range toStop {
 		s.stopPartitionWorker(sub, partition)
 	}
 
-	// Start workers for newly leased partitions
+	// Never start a worker once the ordered drain began: a late workerWg.Add
+	// would race the drain's Wait, and a draining subscriber must not claim
+	// fresh deliveries. Leases acquired on this last tick are released by the
+	// drain, or kept for takeover when their deliveries remain unsettled.
+	if sub.isDraining() {
+		return
+	}
+
+	// Start workers for newly leased partitions, capturing the fencing epoch.
 	for _, partition := range toStart {
-		s.startPartitionWorker(ctx, sub, partition)
+		s.startPartitionWorker(ctx, sub, partition, leaseGenerations[partition])
 	}
 }
 
-// startPartitionWorker creates and starts a worker goroutine for a partition.
-// The worker is tracked in sub.workers (for reconciliation) and sub.workerWg
-// (for shutdown synchronization).
-func (s *subscriber) startPartitionWorker(ctx context.Context, sub *subscription, partition entityqueue.PartitionIdentity) {
+// startPartitionWorker creates and starts a worker goroutine for a partition,
+// capturing generation as its fencing token. The worker is tracked in
+// sub.workers (for reconciliation) and sub.workerWg (for shutdown synchronization).
+//
+// The drain check and workerWg.Add happen inside workersMu: stopAllWorkers
+// takes the same lock for its shutdown snapshot, so a worker start is either
+// visible to the snapshot (and waited on) or it observes the started drain
+// and is suppressed. A workerWg.Add after the drain's Wait began would violate
+// the WaitGroup contract.
+func (s *subscriber) startPartitionWorker(ctx context.Context, sub *subscription, partition entityqueue.PartitionIdentity, generation int64) {
 	workerCtx, cancel := context.WithCancel(ctx)
 
 	w := &partitionWorker{
@@ -1095,21 +1291,30 @@ func (s *subscriber) startPartitionWorker(ctx context.Context, sub *subscription
 		partitionKey: partition.PartitionKey,
 		sub:          sub,
 		subscriber:   s,
+		generation:   generation,
 		cancelFunc:   cancel,
 		done:         make(chan struct{}),
 	}
 
 	sub.workersMu.Lock()
+	if sub.isDrainingLocked() {
+		// Drain started while the supervisor was reconciling: never track or
+		// spawn this worker. Its parent ctx is canceled anyway.
+		sub.workersMu.Unlock()
+		cancel()
+		return
+	}
 	sub.workers[partition] = w
+	sub.workerWg.Add(1)
 	sub.workersMu.Unlock()
 
-	sub.workerWg.Add(1)
 	go w.run(workerCtx)
 
 	s.logger.Debugw("started partition worker",
 		"tenant", partition.Tenant,
 		"topic", sub.topic,
 		"partition_key", partition.PartitionKey,
+		"lease_generation", generation,
 	)
 }
 
@@ -1177,6 +1382,21 @@ func (w *partitionWorker) run(ctx context.Context) {
 			// return to — the only recovery is to retry on the next tick, which
 			// happens automatically. All pollAndDeliver operations are idempotent.
 			if err := w.pollAndDeliver(ctx); err != nil {
+				// The lease moved to another owner: stop this worker without
+				// releasing the lease. In-flight deliveries keep carrying this
+				// token and their writes are rejected server-side.
+				var fenced *ErrLeaseFenced
+				if errors.As(err, &fenced) {
+					w.subscriber.logger.Infow("partition worker fenced, exiting",
+						"tenant", w.tenant,
+						"topic", w.sub.topic,
+						"partition_key", w.partitionKey,
+						"lease_generation", w.generation,
+						"error", err,
+					)
+					w.subscriber.stopPartitionWorker(w.sub, w.identity())
+					return
+				}
 				// A stopped worker has no next tick to recover on. Its context is
 				// deliberately cancelled to interrupt any in-flight store call, so
 				// the resulting error is part of normal teardown.
@@ -1204,6 +1424,19 @@ func (w *partitionWorker) run(ctx context.Context) {
 	}
 }
 
+// leaseToken returns the fencing identity this worker's writes carry.
+func (w *partitionWorker) leaseToken() partitionLeaseToken {
+	return partitionLeaseToken{
+		leasedBy:   w.sub.config.SubscriberName,
+		generation: w.generation,
+	}
+}
+
+// identity names the partition this worker owns.
+func (w *partitionWorker) identity() entityqueue.PartitionIdentity {
+	return entityqueue.PartitionIdentity{Tenant: w.tenant, PartitionKey: w.partitionKey}
+}
+
 // pollAndDeliver fetches messages from this worker's partition and delivers them.
 // Returns an error if any DB operation fails — the caller logs once and the ticker
 // retries on the next tick. All operations are idempotent, so retries are safe.
@@ -1224,6 +1457,16 @@ func (w *partitionWorker) pollAndDeliver(ctx context.Context) (retErr error) {
 		metrics.NewTag("topic", sub.topic),
 	)
 	defer func() { op.Complete(retErr) }()
+
+	// Fast-path ownership check before claiming any visibility. The guarded
+	// MarkDelivered below remains authoritative for the check-then-write race.
+	owned, err := s.leaseStore.CheckLeaseOwnership(ctx, w.leaseToken(), tenant, sub.topic, partitionKey, cfg.ConsumerGroup)
+	if err != nil {
+		return fmt.Errorf("check lease ownership: %w", err)
+	}
+	if !owned {
+		return fencedWriteError(w.leaseToken(), tenant, sub.topic, partitionKey)
+	}
 
 	// Initialize offset for this partition once per worker lifetime
 	if !w.offsetInitialized {
@@ -1271,7 +1514,7 @@ func (w *partitionWorker) pollAndDeliver(ctx context.Context) (retErr error) {
 
 		// Mark as delivered (in-flight) in delivery state.
 		// Returns the resulting retry_count, avoiding a separate GetRetryCount call.
-		retryCount, err := s.deliveryStateStore.MarkDelivered(ctx, cfg.ConsumerGroup, tenant, sub.topic, partitionKey, row.Offset, cfg.VisibilityTimeoutMs)
+		retryCount, err := s.deliveryStateStore.MarkDelivered(ctx, w.leaseToken(), cfg.ConsumerGroup, tenant, sub.topic, partitionKey, row.Offset, cfg.VisibilityTimeoutMs)
 		if err != nil {
 			return fmt.Errorf("mark delivered offset=%d: %w", row.Offset, err)
 		}
@@ -1295,14 +1538,11 @@ func (w *partitionWorker) pollAndDeliver(ctx context.Context) (retErr error) {
 			// visibility timeout expired unacked.
 			if cfg.DLQ.Enabled {
 				retryLimitFailure := failure.New("exceeded retry limit")
-				if err := s.messageStore.MoveToDLQ(ctx, tenant, sub.topic, partitionKey, row.ID, retryCount, retryLimitFailure, cfg.DLQ.TopicSuffix); err != nil {
-					return fmt.Errorf("move to DLQ message=%s: %w", row.ID, err)
+				if err := s.messageStore.MoveToDLQAndAck(ctx, w.leaseToken(), cfg.ConsumerGroup, tenant, sub.topic, partitionKey, row.ID, retryCount, retryLimitFailure, cfg.DLQ.TopicSuffix); err != nil {
+					return fmt.Errorf("move to DLQ and ack message=%s: %w", row.ID, err)
 				}
-			}
-
-			// Mark as acked so watermark can advance past it.
-			// Watermark advancement is deferred to the poll loop.
-			if err := s.deliveryStateStore.MarkAcked(ctx, cfg.ConsumerGroup, tenant, sub.topic, partitionKey, row.Offset); err != nil {
+			} else if err := s.deliveryStateStore.MarkAcked(ctx, w.leaseToken(), cfg.ConsumerGroup, tenant, sub.topic, partitionKey, row.Offset); err != nil {
+				// DLQ disabled: mark acked so the watermark passes the row.
 				return fmt.Errorf("mark acked after retry limit message=%s: %w", row.ID, err)
 			}
 			continue
@@ -1373,6 +1613,8 @@ func (w *partitionWorker) pollAndDeliver(ctx context.Context) (retErr error) {
 			retryCount+1, // RetryCount is 0-based, Attempt is 1-based
 			deliveryMetadata,
 			s,
+			sub,
+			w.leaseToken(),
 			tenant,
 			sub.topic,
 			partitionKey,
@@ -1385,19 +1627,24 @@ func (w *partitionWorker) pollAndDeliver(ctx context.Context) (retErr error) {
 			failed,
 		)
 
-		// Deliver message
+		// Deliver message. Once draining started, stop handing out new
+		// deliveries: the row was marked in-flight, so its visibility
+		// timeout hands it to the next owner instead of this shutdown.
 		select {
 		case sub.deliveryCh <- delivery:
-			messageCount++
+		case <-sub.drainStart:
+			return nil
 		case <-ctx.Done():
 			return nil
 		}
+		sub.trackOutstanding(delivery)
+		messageCount++
 	}
 
 	// Advance watermark periodically (on every poll tick).
 	// This is deferred from Ack() to reduce per-ack latency to 1 DB call.
 	// advanceWatermark is idempotent and incremental — safe to call every tick.
-	if err := s.advanceWatermark(ctx, tenant, cfg.ConsumerGroup, sub.topic, partitionKey); err != nil {
+	if err := s.advanceWatermark(ctx, w.leaseToken(), tenant, cfg.ConsumerGroup, sub.topic, partitionKey); err != nil {
 		s.logger.Warnw("watermark advancement failed",
 			"topic", sub.topic,
 			"partition_key", partitionKey,
@@ -1458,16 +1705,14 @@ func (s *subscriber) runLeaseTick(ctx context.Context, sub *subscription, timeou
 	activeSubscribers := 0
 	fairShareCap := 0
 	shareObserved := false
-	var remainingByTenant map[string]int
-	leasedByTenant, err := s.leaseStore.GetLeasedPartitionsForTenants(tickCtx, s.tenants, sub.topic, cfg.SubscriberName, cfg.ConsumerGroup)
-	if err != nil {
-		s.logger.Errorw("get leased partitions failed", append(logFields, "error", err)...)
+	releasedByTenant := make(map[string]map[string]struct{}, len(s.tenants))
+	leasedByTenant, leasedErr := s.leaseStore.GetLeasedPartitionsForTenants(tickCtx, s.tenants, sub.topic, cfg.SubscriberName, cfg.ConsumerGroup)
+	if leasedErr != nil {
+		s.logger.Errorw("get leased partitions failed", append(logFields, "error", leasedErr)...)
 	} else {
-		remainingByTenant = make(map[string]int, len(s.tenants))
 		for _, tenant := range s.tenants {
 			n := len(leasedByTenant[tenant])
 			ownedPartitions += n
-			remainingByTenant[tenant] = n
 		}
 		activeByTenant, err := s.heartbeatStore.ActiveSubscribersForTenants(tickCtx, s.tenants, sub.topic, cfg.ConsumerGroup, cfg.LeaseDurationMs)
 		if err != nil {
@@ -1481,8 +1726,9 @@ func (s *subscriber) runLeaseTick(ctx context.Context, sub *subscription, timeou
 				owned := leasedByTenant[tenant]
 				active := activeByTenant[tenant]
 				discoveredKeys := partitionKeysForTenant(discovered, tenant)
-				shareCap := s.fairShareCap(sub, owned, discoveredKeys, active)
-				cap := reportedFairShareCap(shareCap, owned, discoveredKeys)
+				ownedKeys := leasePartitionKeys(owned)
+				shareCap := s.fairShareCap(sub, ownedKeys, discoveredKeys, active)
+				cap := reportedFairShareCap(shareCap, ownedKeys, discoveredKeys)
 				activeSubscribers += len(active)
 				fairShareCap += cap
 				s.observeLeaseOwnership(sub, tenant, len(owned), len(active), cap)
@@ -1491,23 +1737,57 @@ func (s *subscriber) runLeaseTick(ctx context.Context, sub *subscription, timeou
 					s.logger.Errorw("rebalance failed", append(logFields, "tenant", tenant, "error", err)...)
 					continue
 				}
-				if n := len(released); n > 0 {
-					ownedPartitions -= n
-					remainingByTenant[tenant] = len(owned) - n
-					s.observeLeaseOwnership(sub, tenant, remainingByTenant[tenant], len(active), cap)
+				if len(released) > 0 {
+					releasedSet := make(map[string]struct{}, len(released))
+					for _, pk := range released {
+						releasedSet[pk] = struct{}{}
+					}
+					releasedByTenant[tenant] = releasedSet
+					ownedPartitions -= len(released)
+					s.observeLeaseOwnership(sub, tenant, len(owned)-len(released), len(active), cap)
 				}
 			}
 		}
 	}
-	renewed, err := s.leaseStore.RenewOwnedLeases(tickCtx, s.tenants, sub.topic, cfg.SubscriberName, cfg.ConsumerGroup)
-	if err != nil {
-		s.logger.Errorw("lease renewal failed", append(logFields, "error", err)...)
-	} else {
-		s.recordLeaseRenewed(sub, remainingByTenant, renewed)
+	// Renew per partition with the fencing token. A zero-row renewal means
+	// the lease was stolen or purged: fence the worker immediately so its
+	// in-flight delivery writes fail closed against the new owner; a store
+	// error is transient and retried next tick without fencing.
+	var renewed int64
+	lost := 0
+	if leasedErr == nil {
+		for _, tenant := range s.tenants {
+			for _, lease := range leasedByTenant[tenant] {
+				if releasedSet := releasedByTenant[tenant]; releasedSet != nil {
+					if _, released := releasedSet[lease.PartitionKey]; released {
+						continue
+					}
+				}
+				ok, err := s.leaseStore.RenewLease(tickCtx, tenant, sub.topic, lease.PartitionKey, cfg.SubscriberName, cfg.ConsumerGroup, lease.Generation)
+				if err != nil {
+					s.logger.Errorw("lease renewal failed", append(leaseLogFields(sub, tenant, lease.PartitionKey),
+						"lease_generation", lease.Generation, logError, err)...)
+					continue
+				}
+				if !ok {
+					lost++
+					ownedPartitions--
+					partition := entityqueue.PartitionIdentity{Tenant: tenant, PartitionKey: lease.PartitionKey}
+					s.stopPartitionWorker(sub, partition)
+					s.recordLeaseCounter(sub, tenant, "lost", 1)
+					s.logger.Warnw("lease lost on renewal; partition worker fenced",
+						append(leaseLogFields(sub, tenant, lease.PartitionKey), "lease_generation", lease.Generation)...)
+					continue
+				}
+				renewed++
+				s.recordLeaseCounter(sub, tenant, "renewed", 1)
+			}
+		}
 	}
 	tickFields := append(append([]any{}, logFields...),
 		logOwnedPartitions, ownedPartitions,
 		logRenewed, renewed,
+		"lost", lost,
 	)
 	if len(s.tenants) == 1 && shareObserved {
 		tickFields = append(tickFields,
@@ -1527,58 +1807,190 @@ func (s *subscriber) runLeaseTick(ctx context.Context, sub *subscription, timeou
 	}
 }
 
-func (s *subscriber) recordLeaseRenewed(sub *subscription, remainingByTenant map[string]int, renewed int64) {
-	if renewed <= 0 {
-		return
-	}
-	if remainingByTenant != nil {
-		var sum int64
-		for _, tenant := range s.tenants {
-			sum += int64(remainingByTenant[tenant])
+// beginShutdown starts the ordered drain once. It signals drainStart,
+// cancels the subscription context (stopping fetch/renew/rebalance), and
+// launches the bounded drain run; concurrent or duplicate triggers only
+// join via drainDone.
+func (s *subscriber) beginShutdown(ctx context.Context, sub *subscription) {
+	sub.drainOnce.Do(func() {
+		if sub.drainStart == nil {
+			sub.drainStart = make(chan struct{})
 		}
-		if sum == renewed {
-			for _, tenant := range s.tenants {
-				if n := remainingByTenant[tenant]; n > 0 {
-					s.recordLeaseCounter(sub, tenant, "renewed", int64(n))
-				}
-			}
-			return
+		if sub.drainDone == nil {
+			sub.drainDone = make(chan struct{})
 		}
-	}
-	metrics.NamedCounter(s.scope, "lease", "renewed", renewed,
-		metrics.NewTag(logLeasedBy, sub.config.SubscriberName),
-		metrics.NewTag("topic", sub.topic),
-		metrics.NewTag(logConsumerGroup, sub.config.ConsumerGroup),
-	)
+		close(sub.drainStart)
+		if sub.cancelFunc != nil {
+			sub.cancelFunc()
+		}
+		go s.runShutdown(ctx, sub)
+	})
 }
 
-func (s *subscriber) releaseAllLeases(ctx context.Context, sub *subscription) error {
+// runShutdown executes the ordered drain sequence once and closes drainDone.
+// Everything it does is bounded by ctx, so Close() returning early on its own
+// deadline never leaves an unbounded background goroutine behind.
+func (s *subscriber) runShutdown(ctx context.Context, sub *subscription) {
+	defer close(sub.drainDone)
+
 	cfg := sub.config
-	var released int64
-	var firstErr error
-	for _, tenant := range s.tenants {
-		n, err := s.leaseStore.ReleaseOwnedLeases(ctx, []string{tenant}, sub.topic, cfg.SubscriberName, cfg.ConsumerGroup)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("release owned leases tenant=%s: %w", tenant, err)
-			}
+	logFields := []any{
+		logTopic, sub.topic,
+		logConsumerGroup, cfg.ConsumerGroup,
+		logLeasedBy, cfg.SubscriberName,
+	}
+
+	// Snapshot the workers and their fencing tokens before they exit; the
+	// final watermark commit and lease release need their generations.
+	sub.workersMu.Lock()
+	partitionTokens := make(map[entityqueue.PartitionIdentity]int64, len(sub.workers))
+	for partition, worker := range sub.workers {
+		partitionTokens[partition] = worker.generation
+	}
+	sub.workersMu.Unlock()
+
+	// (a) Stop claiming and polling: the subscription context is already
+	// cancelled; cancel every worker explicitly to interrupt in-flight calls.
+	s.stopAllWorkers(sub)
+
+	// (b) Wait for in-flight deliveries to settle or become safely visible.
+	waitErr := s.waitOutstanding(ctx, sub)
+
+	// (c) Workers are ctx-bound, so they are already unwinding; a short grace
+	// covers goroutine teardown without holding the drain budget.
+	workerExitCtx, workerCancel := context.WithTimeout(context.Background(), workerShutdownGrace)
+	workersDone := make(chan struct{})
+	go func() {
+		sub.workerWg.Wait()
+		close(workersDone)
+	}()
+	workersExited := false
+	select {
+	case <-workersDone:
+		workersExited = true
+	case <-workerExitCtx.Done():
+		s.logger.Warnw("shutdown proceeded before all workers exited", append(logFields, "error", workerExitCtx.Err())...)
+	}
+	workerCancel()
+
+	// Partition set still carrying unsettled deliveries after the deadline.
+	pendingPartitions, _, pendingCount := sub.drainWait(time.Now())
+
+	drained := make([]entityqueue.PartitionIdentity, 0, len(partitionTokens))
+	for partition := range partitionTokens {
+		if _, pending := pendingPartitions[partition]; pending {
 			continue
 		}
-		if n > 0 {
-			released += n
-			s.recordLeaseReleased(sub, tenant, leaseReasonShutdown, n)
+		drained = append(drained, partition)
+	}
+
+	// (d) Final watermark commit and generation-guarded lease release run on
+	// a fresh, bounded cleanup context: clean partitions release even when
+	// the drain wait itself used its full deadline; undrained partitions keep
+	// their leases for takeover.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cleanupCancel()
+	for _, partition := range drained {
+		token := partitionLeaseToken{leasedBy: cfg.SubscriberName, generation: partitionTokens[partition]}
+		if err := s.advanceWatermark(cleanupCtx, token, partition.Tenant, cfg.ConsumerGroup, sub.topic, partition.PartitionKey); err != nil {
+			s.logger.Errorw("shutdown watermark commit failed",
+				append(leaseLogFields(sub, partition.Tenant, partition.PartitionKey), logError, err)...)
 		}
 	}
-	if released > 0 {
-		s.logger.Infow("released leases on shutdown",
-			"topic", sub.topic,
-			logConsumerGroup, cfg.ConsumerGroup,
-			logLeasedBy, cfg.SubscriberName,
-			logReason, leaseReasonShutdown,
-			"released", released,
-		)
+	for _, partition := range drained {
+		token := partitionLeaseToken{leasedBy: cfg.SubscriberName, generation: partitionTokens[partition]}
+		rows, err := s.leaseStore.ReleaseLease(cleanupCtx, partition.Tenant, sub.topic, partition.PartitionKey,
+			cfg.SubscriberName, cfg.ConsumerGroup, token.generation)
+		if err != nil {
+			s.logger.Errorw("failed to release lease during shutdown",
+				append(leaseLogFields(sub, partition.Tenant, partition.PartitionKey), logError, err)...)
+			continue
+		}
+		if rows > 0 {
+			s.recordLeaseReleased(sub, partition.Tenant, leaseReasonShutdown, rows)
+		}
 	}
-	return firstErr
+
+	if pendingCount > 0 {
+		s.logger.Warnw("shutdown leaves leases for takeover with outstanding deliveries",
+			append(logFields, "outstanding", pendingCount)...)
+	}
+
+	// (e) Best-effort heartbeat deregistration, independent of drain outcome.
+	if err := s.deregisterHeartbeat(cleanupCtx, sub); err != nil {
+		s.logger.Errorw("failed to deregister heartbeat during shutdown", append(logFields, logError, err)...)
+	}
+
+	// Close deliveryCh only when every worker goroutine has exited; a send on
+	// a closed channel panics, and a worker still unwinding must never hit one.
+	if workersExited {
+		close(sub.deliveryCh)
+	}
+
+	if waitErr != nil {
+		sub.drainErr = waitErr
+		s.logger.Errorw("subscription shutdown drain incomplete", append(logFields, logError, waitErr)...)
+	}
+	s.logger.Infow("subscription shutdown complete", append(logFields,
+		"drained_partitions", len(drained),
+		"pending_partitions", pendingCount,
+	)...)
+}
+
+// waitOutstanding blocks while deliveries handed to the framework have no
+// terminal outcome. A delivery whose terminal write failed (e.g. fenced) is
+// waited until its visibility deadline passes; the whole wait is bounded by
+// ctx.
+func (s *subscriber) waitOutstanding(ctx context.Context, sub *subscription) error {
+	for {
+		_, safeWait, pending := sub.drainWait(time.Now())
+		if pending == 0 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("drain deadline exceeded, %d deliveries outstanding: %w", pending, err)
+		}
+		wait := safeWait
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
+			}
+		}
+		timer := time.NewTimer(max(wait, 0))
+		select {
+		case <-sub.settleEvents:
+			// A delivery settled (or extended): recompute the wait.
+		case <-timer.C:
+			// Some visibility deadline elapsed: loop and re-evaluate.
+		case <-ctx.Done():
+			// Deadline passes are returned at the top of the next iteration.
+		}
+		timer.Stop()
+	}
+}
+
+// ShutdownSubscription drains a single subscription in the ordered sequence:
+// stop fetching, wait for in-flight deliveries to settle (or their visibility
+// deadlines), commit watermarks, then release leases and deregister the
+// heartbeat. Idempotent and safe to call concurrently with itself and Close:
+// every caller joins the same run via drainDone.
+func (s *subscriber) ShutdownSubscription(ctx context.Context, topic, consumerGroup string) error {
+	subKey := topic + ":" + consumerGroup
+	s.mu.RLock()
+	sub, ok := s.subscriptions[subKey]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrSubscriberClosed
+	}
+	s.beginShutdown(ctx, sub)
+	select {
+	case <-sub.drainDone:
+		return sub.drainErr
+	case <-ctx.Done():
+		// The drain itself continues bounded by its deadline so leases still
+		// reach release even if this caller stops waiting.
+		return ctx.Err()
+	}
 }
 
 func (s *subscriber) sendHeartbeats(ctx context.Context, sub *subscription) error {
@@ -1600,27 +2012,30 @@ func (s *subscriber) deregisterHeartbeat(ctx context.Context, sub *subscription)
 // rebalance checks if this subscriber holds more partitions than its fair share
 // and releases extras so other subscribers can pick them up. Returns the
 // partitions actually released so the caller renews only the remainder —
-// renewing a just-released lease would spuriously fail with ErrLeaseExpired.
-// The owned slice is never mutated (the caller shares it with lease renewal).
-// On error, partitions released before the failure are still returned.
-func (s *subscriber) rebalance(ctx context.Context, sub *subscription, tenant string, owned []string, active []string) (released []string, retErr error) {
+// renewing a just-released lease would fail its generation guard. The owned
+// slice is never mutated (the caller shares it with lease renewal). On error,
+// partitions released before the failure are still returned.
+func (s *subscriber) rebalance(ctx context.Context, sub *subscription, tenant string, owned []leaseInfo, active []string) (released []string, retErr error) {
 	cfg := sub.config
 
 	sub.workersMu.Lock()
 	discoveredPartitions := partitionKeysForTenant(sub.lastDiscoveredPartitions, tenant)
 	sub.workersMu.Unlock()
 
-	maxPart := s.fairShareCap(sub, owned, discoveredPartitions, active)
-	if maxPart == 0 || len(owned) <= maxPart {
+	ownedKeys := leasePartitionKeys(owned)
+	maxPart := s.fairShareCap(sub, ownedKeys, discoveredPartitions, active)
+	if maxPart == 0 || len(ownedKeys) <= maxPart {
 		return nil, nil
 	}
 
-	sortedOwned := make([]string, len(owned))
-	copy(sortedOwned, owned)
-	sort.Strings(sortedOwned)
+	sortedOwned := append([]leaseInfo(nil), owned...)
+	sort.Slice(sortedOwned, func(i, j int) bool {
+		return sortedOwned[i].PartitionKey < sortedOwned[j].PartitionKey
+	})
 
-	for _, pk := range sortedOwned[maxPart:] {
-		rows, err := s.leaseStore.ReleaseLease(ctx, tenant, sub.topic, pk, cfg.SubscriberName, cfg.ConsumerGroup)
+	for _, lease := range sortedOwned[maxPart:] {
+		pk := lease.PartitionKey
+		rows, err := s.leaseStore.ReleaseLease(ctx, tenant, sub.topic, pk, cfg.SubscriberName, cfg.ConsumerGroup, lease.Generation)
 		if err != nil {
 			return released, fmt.Errorf("release partition %s during rebalance: %w", pk, err)
 		}
@@ -1634,6 +2049,7 @@ func (s *subscriber) rebalance(ctx context.Context, sub *subscription, tenant st
 					logReason, leaseReasonRebalance,
 					"owned", len(owned),
 					"max_partitions", maxPart,
+					"lease_generation", lease.Generation,
 				)...,
 			)
 		}
@@ -1709,8 +2125,11 @@ func (s *subscriber) fairShareCap(sub *subscription, owned []string, discoveredP
 	return maxPart
 }
 
-// Close cancels every subscription and waits up to subscriptionShutdownTimeout
-// for each supervisor. Timed-out supervisors finish asynchronously.
+// Close drains every subscription in the ordered sequence and waits up to
+// the configured shutdown timeout per subscription. Each drain is bounded on
+// its own (cleanup contexts and worker grace), so a timeout never leaves an
+// unbounded background goroutine behind; leases with unsettled deliveries are
+// kept for takeover by another subscriber.
 func (s *subscriber) Close() (retErr error) {
 	op := metrics.Begin(s.scope, "close", metrics.StorageLatencyBuckets)
 	defer func() { op.Complete(retErr) }()
@@ -1732,17 +2151,35 @@ func (s *subscriber) Close() (retErr error) {
 			"topic", sub.topic,
 			"consumer_group", sub.config.ConsumerGroup,
 		)
-		sub.cancelFunc()
 		closing = append(closing, sub)
 	}
 	s.subscriptions = make(map[string]*subscription)
 	s.subMu.Unlock()
 
 	for _, sub := range closing {
+		// Start the ordered drain explicitly: do not wait for the
+		// supervisor's select to notice the cancelled context.
+		drainCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+		s.beginShutdown(drainCtx, sub)
+
 		timer := time.NewTimer(s.shutdownTimeout)
 		select {
-		case <-sub.done:
+		case <-sub.drainDone:
 			timer.Stop()
+			if sub.drainErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf(
+					"subscription shutdown incomplete: topic=%q consumer_group=%q: %w",
+					sub.topic, sub.config.ConsumerGroup, sub.drainErr,
+				))
+				metrics.NamedCounter(
+					s.scope,
+					"close",
+					"subscription_timeout",
+					1,
+					metrics.NewTag("topic", sub.topic),
+					metrics.NewTag("consumer_group", sub.config.ConsumerGroup),
+				)
+			}
 		case <-timer.C:
 			retErr = errors.Join(retErr, fmt.Errorf(
 				"subscription shutdown timed out: topic=%q consumer_group=%q",
@@ -1762,6 +2199,10 @@ func (s *subscriber) Close() (retErr error) {
 				"consumer_group", sub.config.ConsumerGroup,
 			)
 		}
+		// On timeout this ends only the wait phase: the drain's cleanup runs
+		// on its own fresh, bounded context, and undrained leases stay for
+		// takeover rather than stranding an unbounded background goroutine.
+		cancel()
 	}
 
 	s.logger.Infow("subscriber closed")

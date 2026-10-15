@@ -87,6 +87,7 @@ platform/extension/messagequeue/mysql/
 ├── delivery_state_store.go         # queue_delivery_state table operations (per-consumer-group)
 ├── offset_store.go                 # queue_offsets table operations (watermark tracking)
 ├── partition_lease_store.go        # queue_partition_leases table operations
+├── lease_guard.go                  # lease_generation fencing guard shared by owner-scoped writes
 ├── subscriber_heartbeat_store.go   # queue_subscriber_heartbeats table operations
 ├── publisher.go                    # Publisher implementation
 ├── subscriber.go                   # Subscriber, delivery, goroutine management
@@ -110,7 +111,7 @@ platform/extension/messagequeue/mysql/
 | `queue_messages` | Immutable append-only message log | `(topic, partition_key)` — shared across consumer groups |
 | `queue_delivery_state` | Visibility, ack state, retry count, postponed flag | `(consumer_group, topic, partition_key, offset)` |
 | `queue_offsets` | Contiguous acked watermark | `(consumer_group, topic, partition_key)` |
-| `queue_partition_leases` | Partition lease coordination | `(consumer_group, topic, partition_key)` |
+| `queue_partition_leases` | Partition lease coordination plus the `lease_generation` fencing epoch | `(consumer_group, topic, partition_key)` |
 | `queue_subscriber_heartbeats` | Active subscriber tracking | `(consumer_group, topic, subscriber_name)` |
 
 `queue_delivery_state` has a `postponed BOOLEAN NOT NULL DEFAULT FALSE` column that supports `Delivery.Postpone`. `MarkPostponed` sets `invisible_until = now + delay`, resets `retry_count` to 0, and sets the flag. While the flag is set and the row is invisible, the poll loop treats the message as a **barrier** — it stops scanning the partition instead of skipping past it (nacked rows keep skip-and-continue semantics, so a failed message never halts its partition). On the next `MarkDelivered` the flag is consumed: the `retry_count` increment is skipped and the flag cleared, so a postponed redelivery restarts as attempt 1 and only consecutive real failures count toward `Retry.MaxAttempts`. Default FALSE keeps existing rows back-compatible.
@@ -140,26 +141,32 @@ Subscribe()
 
 Each partition worker runs independently — polls the DB on a ticker, checks deliverability via `GetDeliveryState` per message, and sends deliveries to the shared channel. A slow or blocked partition does not affect other partitions.
 
+### Lease Fencing
+
+Every partition lease carries a `lease_generation` fencing epoch: 1 on first acquisition, incremented by one when a stale lease is stolen by a different subscriber, and unchanged by renewal by the current owner. A partition worker captures its generation when it starts, and every owner-scoped write it makes — visibility claim, ack/nack/postpone, visibility extension, watermark advance, lease renewal and release, and the dead-letter move — is conditioned on `(leased_by, lease_generation)`. A write whose lease has moved matches no rows; a follow-up existence read distinguishes a legitimate no-op while still owning (e.g. re-acking) from a lost lease, and the latter returns `*ErrLeaseFenced`. A fenced worker exits without releasing the lease, the stale delivery stays governed by its visibility timeout, and the current owner redelivers it — a worker that lost a partition fails closed even with a delivery still in flight.
+
+The dead-letter move and its ack share one transaction (`MoveToDLQAndAck`): the row is copied to the DLQ topic, deleted from the main topic, and the group's delivery state is marked acked, with the ack guarded by the same fencing token. A crash leaves either all three changes or none, so the move can never lose a message.
+
 ### Shutdown Sequence
 
-When `Close()` is called:
-1. Subscription context is cancelled
-2. `managePartitions` calls `stopAllWorkers` — cancels each worker's context, waits up to 30s
-3. Partition leases are released (fresh context, not cancelled)
-4. Subscriber heartbeat is deregistered
-5. `workerWg.Wait()` — blocks until all workers have fully exited
-6. `deliveryCh` is closed — safe because no senders remain after step 5
-7. `managePartitions` returns → `wg.Done()` → `Close()` unblocks
+Shutdown is an ordered drain rather than an immediate cancel. `Close()` and an explicit `ShutdownSubscription(ctx, topic, group)` (the `extension/messagequeue.DrainingSubscriber` interface) trigger the same idempotent run, and every concurrent caller joins it:
 
-The `workerWg.Wait()` before `close(deliveryCh)` prevents a race where a slow worker could send on a closed channel.
+1. Stop claiming — signal drain start and cancel the subscription context and every partition worker, so fetching, lease renewal, and rebalance all stop.
+2. Wait for in-flight deliveries to settle (ack/nack/postpone/reject) or until their visibility deadlines safely pass, bounded by the caller's deadline.
+3. Wait briefly for the canceled workers to exit, then commit the final watermark for each fully drained partition and release its lease with the captured generation. A partition whose deliveries are still inside their visibility window when the deadline passes keeps its lease so a new owner can take it over.
+4. Deregister the heartbeat. The delivery channel is closed only after every worker goroutine has exited, so a worker can never send on a closed channel.
+
+The drain's cleanup steps run on their own bounded contexts: an expired caller deadline stops the wait and proceeds to cleanup, it does not strand an unbounded background goroutine; if cleanup cannot finish in its own budget the run exits with leases left for takeover.
+
+The consumer framework drives this drain from `Stop()`: it stops routing new deliveries, lets in-flight `Process` calls finish, nack-abandons buffered deliveries that were never dispatched, and runs `ShutdownSubscription` concurrently with the wait for in-flight work.
 
 ### Worker Stop Behavior
 
-When a partition worker is stopped (lease lost or shutdown):
-- Immediately removed from workers map and context cancelled
-- Caller waits up to 30s for exit confirmation (warning logged on timeout)
-- `workerWg` tracks the goroutine regardless — `Close()` always waits for full exit
-- Reconciliation can start a replacement immediately — brief overlap is harmless with at-least-once semantics
+When a partition worker is stopped (lease lost, fencing error, or shutdown):
+- Immediately removed from the workers map and its context canceled; `workerWg` keeps tracking it
+- On a lost lease or a fenced write it exits *without* releasing the lease — the row stays for the new owner, with the generation that made the old worker's writes fail closed
+- During shutdown the drain waits briefly for exit before closing the delivery channel; a still-running worker blocks the channel close
+- Reconciliation starts a replacement only while the lease is held at a current generation — brief overlap is harmless with at-least-once semantics
 
 ### Logger Hierarchy
 

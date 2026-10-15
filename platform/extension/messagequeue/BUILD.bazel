@@ -4,6 +4,7 @@ go_library(
     name = "go_default_library",
     srcs = [
         "delivery.go",
+        "draining_subscriber.go",
         "publisher.go",
         "queue.go",
         "subscriber.go",

@@ -52,3 +52,24 @@ type ErrLeaseExpired struct {
 func (e *ErrLeaseExpired) Error() string {
 	return fmt.Sprintf("lease expired for topic=%s partition=%s", e.Topic, e.PartitionKey)
 }
+
+// ErrLeaseFenced is returned when an owner-scoped write matches no rows
+// because the partition lease is no longer held at the caller's fencing
+// token (it expired, was released, or was stolen and re-acquired with a new
+// generation). The write has not taken effect; the delivery stays governed
+// by its visibility timeout and is redelivered to the current owner.
+type ErrLeaseFenced struct {
+	// Topic is the topic the write was for.
+	Topic string
+	// PartitionKey is the partition the write was for.
+	PartitionKey string
+	// SubscriberName is the stale owner that attempted the write.
+	SubscriberName string
+	// Generation is the stale fencing generation the write carried.
+	Generation int64
+}
+
+func (e *ErrLeaseFenced) Error() string {
+	return fmt.Sprintf("lease fenced for topic=%s partition=%s subscriber=%s generation=%d",
+		e.Topic, e.PartitionKey, e.SubscriberName, e.Generation)
+}

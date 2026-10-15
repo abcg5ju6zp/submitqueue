@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,6 +36,12 @@ func (minimum unixMillisAtLeast) Match(value driver.Value) bool {
 	return ok && got >= int64(minimum)
 }
 
+var testLeaseToken = partitionLeaseToken{leasedBy: testSubscriberName, generation: 1}
+
+func leaseGuardArgsForTest() []driver.Value {
+	return []driver.Value{testTenant, "group-1", "orders", "part-1", testSubscriberName, int64(1)}
+}
+
 func newTestDeliveryStateStoreWithMock(t *testing.T) (deliveryStateStore, *sql.DB, sqlmock.Sqlmock) {
 	t.Helper()
 	db, mock, err := sqlmock.New()
@@ -47,8 +54,11 @@ func TestDeliveryStateStore_MarkDelivered(t *testing.T) {
 	tests := []struct {
 		name           string
 		execErr        bool
+		fenced         bool
 		queryErr       bool
 		wantRetryCount int
+		wantErr        bool
+		wantFenced     bool
 	}{
 		{
 			name:           "success new insert returns 0",
@@ -61,10 +71,17 @@ func TestDeliveryStateStore_MarkDelivered(t *testing.T) {
 		{
 			name:    "exec error",
 			execErr: true,
+			wantErr: true,
+		},
+		{
+			name:       "zero rows with lease lost is fenced",
+			fenced:     true,
+			wantFenced: true,
 		},
 		{
 			name:     "query error on retry_count SELECT",
 			queryErr: true,
+			wantErr:  true,
 		},
 	}
 
@@ -73,13 +90,22 @@ func TestDeliveryStateStore_MarkDelivered(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
 
-			if tt.execErr {
+			execArgs := append([]driver.Value{testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()}, leaseGuardArgsForTest()...)
+			switch {
+			case tt.execErr:
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()).
+					WithArgs(execArgs...).
 					WillReturnError(assert.AnError)
-			} else {
+			case tt.fenced:
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()).
+					WithArgs(execArgs...).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+					WithArgs(leaseGuardArgsForTest()...).
+					WillReturnRows(sqlmock.NewRows([]string{"1"}))
+			default:
+				mock.ExpectExec("INSERT INTO queue_delivery_state").
+					WithArgs(execArgs...).
 					WillReturnResult(sqlmock.NewResult(1, 1))
 
 				if tt.queryErr {
@@ -93,11 +119,17 @@ func TestDeliveryStateStore_MarkDelivered(t *testing.T) {
 				}
 			}
 
-			retryCount, err := store.MarkDelivered(context.Background(), "group-1", testTenant, "orders", "part-1", 5, 30000)
+			retryCount, err := store.MarkDelivered(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, 30000)
 
-			if tt.execErr || tt.queryErr {
+			switch {
+			case tt.wantFenced:
+				var fenced *ErrLeaseFenced
+				require.ErrorAs(t, err, &fenced)
+				assert.Equal(t, "part-1", fenced.PartitionKey)
+				assert.Equal(t, int64(1), fenced.Generation)
+			case tt.wantErr:
 				require.Error(t, err)
-			} else {
+			default:
 				require.NoError(t, err)
 				assert.Equal(t, tt.wantRetryCount, retryCount)
 			}
@@ -106,19 +138,36 @@ func TestDeliveryStateStore_MarkDelivered(t *testing.T) {
 	}
 }
 
+func TestDeliveryStateStore_ZeroRowsWhileStillOwnedIsNoOp(t *testing.T) {
+	store, db, mock := newTestDeliveryStateStoreWithMock(t)
+	defer db.Close()
+
+	// Re-acking an already acked row matches zero rows, but the lease still
+	// belongs to the caller: the write is an idempotent no-op, not fenced.
+	mock.ExpectExec("INSERT INTO queue_delivery_state").
+		WithArgs(append([]driver.Value{testTenant, "group-1", "orders", "part-1", int64(5)}, leaseGuardArgsForTest()...)...).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+		WithArgs(leaseGuardArgsForTest()...).
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	require.NoError(t, store.MarkAcked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5))
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestDeliveryStateStore_ExtendVisibility(t *testing.T) {
 	tests := []struct {
-		name    string
-		wantErr bool
+		name           string
+		zeroRowsFenced bool
+		zeroRowsNoOp   bool
+		dbErr          bool
+		wantErr        bool
+		wantFenced     bool
 	}{
-		{
-			name:    "success",
-			wantErr: false,
-		},
-		{
-			name:    "db error",
-			wantErr: true,
-		},
+		{name: "success"},
+		{name: "db error", dbErr: true, wantErr: true},
+		{name: "zero rows while lease lost is fenced", zeroRowsFenced: true, wantFenced: true},
+		{name: "zero rows while still owner is no-op", zeroRowsNoOp: true},
 	}
 
 	for _, tt := range tests {
@@ -126,23 +175,90 @@ func TestDeliveryStateStore_ExtendVisibility(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
 
-			if tt.wantErr {
+			execArgs := append([]driver.Value{sqlmock.AnyArg(), testTenant, "group-1", "orders", "part-1", int64(5)}, leaseGuardArgsForTest()...)
+			switch {
+			case tt.dbErr:
 				mock.ExpectExec("UPDATE queue_delivery_state").
-					WithArgs(sqlmock.AnyArg(), testTenant, "group-1", "orders", "part-1", int64(5)).
-					WillReturnError(assert.AnError)
-			} else {
+					WithArgs(execArgs...).
+					WillReturnError(errors.New("db down"))
+			case tt.zeroRowsFenced:
 				mock.ExpectExec("UPDATE queue_delivery_state").
-					WithArgs(sqlmock.AnyArg(), testTenant, "group-1", "orders", "part-1", int64(5)).
+					WithArgs(execArgs...).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+					WithArgs(leaseGuardArgsForTest()...).
+					WillReturnRows(sqlmock.NewRows([]string{"1"}))
+			case tt.zeroRowsNoOp:
+				mock.ExpectExec("UPDATE queue_delivery_state").
+					WithArgs(execArgs...).
+					WillReturnResult(sqlmock.NewResult(0, 0))
+				mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+					WithArgs(leaseGuardArgsForTest()...).
+					WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+			default:
+				mock.ExpectExec("UPDATE queue_delivery_state").
+					WithArgs(execArgs...).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 			}
 
-			err := store.ExtendVisibility(context.Background(), "group-1", testTenant, "orders", "part-1", 5, 60000)
+			err := store.ExtendVisibility(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, 60000)
 
-			if tt.wantErr {
+			switch {
+			case tt.wantFenced:
+				var fenced *ErrLeaseFenced
+				require.ErrorAs(t, err, &fenced)
+			case tt.wantErr:
 				require.Error(t, err)
-			} else {
+			default:
 				require.NoError(t, err)
 			}
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestDeliveryStateStore_MarkTerminalFenced(t *testing.T) {
+	// Every terminal write (Ack/Nack/Postpone) reports ErrLeaseFenced on a
+	// zero-row guarded statement when the lease no longer matches.
+	cases := []struct {
+		name string
+		call func(t *testing.T, store deliveryStateStore) error
+	}{
+		{
+			name: "mark acked fenced",
+			call: func(t *testing.T, store deliveryStateStore) error {
+				return store.MarkAcked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5)
+			},
+		},
+		{
+			name: "mark nacked fenced",
+			call: func(t *testing.T, store deliveryStateStore) error {
+				return store.MarkNacked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, 1000)
+			},
+		},
+		{
+			name: "mark postponed fenced",
+			call: func(t *testing.T, store deliveryStateStore) error {
+				return store.MarkPostponed(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, 5000)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, db, mock := newTestDeliveryStateStoreWithMock(t)
+			defer db.Close()
+
+			mock.ExpectExec("INSERT INTO queue_delivery_state").
+				WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+				WithArgs(leaseGuardArgsForTest()...).
+				WillReturnRows(sqlmock.NewRows([]string{"1"}))
+
+			err := tc.call(t, store)
+			var fenced *ErrLeaseFenced
+			require.ErrorAs(t, err, &fenced)
+			assert.Equal(t, testSubscriberName, fenced.SubscriberName)
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
@@ -151,16 +267,11 @@ func TestDeliveryStateStore_ExtendVisibility(t *testing.T) {
 func TestDeliveryStateStore_MarkAcked(t *testing.T) {
 	tests := []struct {
 		name    string
+		dbErr   bool
 		wantErr bool
 	}{
-		{
-			name:    "success",
-			wantErr: false,
-		},
-		{
-			name:    "db error",
-			wantErr: true,
-		},
+		{name: "success"},
+		{name: "db error", dbErr: true, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -168,17 +279,18 @@ func TestDeliveryStateStore_MarkAcked(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
 
-			if tt.wantErr {
+			args := append([]driver.Value{testTenant, "group-1", "orders", "part-1", int64(5)}, leaseGuardArgsForTest()...)
+			if tt.dbErr {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5)).
+					WithArgs(args...).
 					WillReturnError(assert.AnError)
 			} else {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5)).
+					WithArgs(args...).
 					WillReturnResult(sqlmock.NewResult(1, 1))
 			}
 
-			err := store.MarkAcked(context.Background(), "group-1", testTenant, "orders", "part-1", 5)
+			err := store.MarkAcked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -193,36 +305,33 @@ func TestDeliveryStateStore_MarkAcked(t *testing.T) {
 func TestDeliveryStateStore_MarkNacked(t *testing.T) {
 	tests := []struct {
 		name    string
+		dbErr   bool
 		wantErr bool
 	}{
-		{
-			name:    "success",
-			wantErr: false,
-		},
-		{
-			name:    "db error",
-			wantErr: true,
-		},
+		{name: "success"},
+		{name: "db error", dbErr: true, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
+
 			const retryDelayMs = int64(1000)
 			invisibleUntil := unixMillisAtLeast(time.Now().UnixMilli() + retryDelayMs)
+			args := append([]driver.Value{testTenant, "group-1", "orders", "part-1", int64(5), invisibleUntil}, leaseGuardArgsForTest()...)
 
-			if tt.wantErr {
+			if tt.dbErr {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), invisibleUntil).
+					WithArgs(args...).
 					WillReturnError(assert.AnError)
 			} else {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), invisibleUntil).
+					WithArgs(args...).
 					WillReturnResult(sqlmock.NewResult(1, 1))
 			}
 
-			err := store.MarkNacked(context.Background(), "group-1", testTenant, "orders", "part-1", 5, retryDelayMs)
+			err := store.MarkNacked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, retryDelayMs)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -248,7 +357,7 @@ func TestDeliveryStateStore_MarkNackedRejectsInvalidDelay(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
 
-			err := store.MarkNacked(context.Background(), "group-1", testTenant, "orders", "part-1", 5, tt.delayMs)
+			err := store.MarkNacked(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, tt.delayMs)
 			require.ErrorContains(t, err, "is outside")
 			assert.NoError(t, mock.ExpectationsWereMet())
 		})
@@ -258,16 +367,11 @@ func TestDeliveryStateStore_MarkNackedRejectsInvalidDelay(t *testing.T) {
 func TestDeliveryStateStore_MarkPostponed(t *testing.T) {
 	tests := []struct {
 		name    string
+		dbErr   bool
 		wantErr bool
 	}{
-		{
-			name:    "success",
-			wantErr: false,
-		},
-		{
-			name:    "db error",
-			wantErr: true,
-		},
+		{name: "success"},
+		{name: "db error", dbErr: true, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -275,17 +379,18 @@ func TestDeliveryStateStore_MarkPostponed(t *testing.T) {
 			store, db, mock := newTestDeliveryStateStoreWithMock(t)
 			defer db.Close()
 
-			if tt.wantErr {
+			args := append([]driver.Value{testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()}, leaseGuardArgsForTest()...)
+			if tt.dbErr {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()).
+					WithArgs(args...).
 					WillReturnError(assert.AnError)
 			} else {
 				mock.ExpectExec("INSERT INTO queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", int64(5), sqlmock.AnyArg()).
+					WithArgs(args...).
 					WillReturnResult(sqlmock.NewResult(1, 1))
 			}
 
-			err := store.MarkPostponed(context.Background(), "group-1", testTenant, "orders", "part-1", 5, 5000)
+			err := store.MarkPostponed(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", 5, 5000)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -517,12 +622,13 @@ func TestDeliveryStateStore_AdvanceWatermark(t *testing.T) {
 			}
 
 			if tt.expectCleanup {
+				cleanupArgs := append([]driver.Value{testTenant, "group-1", "orders", "part-1", tt.expectWatermark}, leaseGuardArgsForTest()...)
 				mock.ExpectExec("DELETE FROM queue_delivery_state").
-					WithArgs(testTenant, "group-1", "orders", "part-1", tt.expectWatermark).
+					WithArgs(cleanupArgs...).
 					WillReturnResult(sqlmock.NewResult(0, tt.expectWatermark-tt.currentWatermark))
 			}
 
-			watermark, err := store.AdvanceWatermark(context.Background(), "group-1", testTenant, "orders", "part-1", tt.currentWatermark, tt.offsets)
+			watermark, err := store.AdvanceWatermark(context.Background(), testLeaseToken, "group-1", testTenant, "orders", "part-1", tt.currentWatermark, tt.offsets)
 
 			if tt.dsQueryErr {
 				require.Error(t, err)

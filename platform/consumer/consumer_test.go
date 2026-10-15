@@ -860,6 +860,160 @@ func TestConsumer_Stop(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// fakeDrainingSubscriber wraps a mock subscriber with the ordered-drain hook.
+type fakeDrainingSubscriber struct {
+	*queuemock.MockSubscriber
+	shutdown func(ctx context.Context, topic, consumerGroup string) error
+}
+
+func (f *fakeDrainingSubscriber) ShutdownSubscription(ctx context.Context, topic, consumerGroup string) error {
+	return f.shutdown(ctx, topic, consumerGroup)
+}
+
+func TestConsumer_StopDrain_InFlightAckCompletes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	logger := zaptest.NewLogger(t).Sugar()
+
+	deliveryChan := make(chan extqueue.Delivery, 1)
+	mockSubInner := queuemock.NewMockSubscriber(ctrl)
+	mockSubInner.EXPECT().Subscribe(gomock.Any(), gomock.Any(), gomock.Any()).Return(deliveryChan, nil)
+	shutdownCalled := make(chan struct{})
+	mockSub := &fakeDrainingSubscriber{
+		MockSubscriber: mockSubInner,
+		shutdown: func(ctx context.Context, _, _ string) error {
+			close(shutdownCalled)
+			return nil
+		},
+	}
+
+	mockQ := queuemock.NewMockQueue(ctrl)
+	mockQ.EXPECT().Subscriber().Return(mockSub).AnyTimes()
+
+	reg := newRegistry(t, mockQ, testTopicKeyStart, "test-group")
+	c := New(logger, tally.NoopScope, reg, errs.NewClassifierProcessor(), consumergatenoop.New())
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	handler := &testController{}
+	setupController(handler, "test-handler", testTopicKeyStart, "test-group",
+		func(ctx context.Context, _ Delivery) error {
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	)
+	require.NoError(t, c.Register(handler))
+	require.NoError(t, c.Start(context.Background()))
+
+	msg := entityqueue.NewMessage("m1", nil, "partition1", nil)
+	mockDel := queuemock.NewMockDelivery(ctrl)
+	done := setupDelivery(mockDel, msg, nil, nil)
+	deliveryChan <- mockDel
+	<-started
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- c.Stop(3000) }()
+	<-shutdownCalled
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight delivery was not acked during drain")
+	}
+	require.NoError(t, <-stopErr)
+}
+
+func TestConsumer_StopDrain_AbandonsBufferedDelivery(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	logger := zaptest.NewLogger(t).Sugar()
+
+	deliveryChan := make(chan extqueue.Delivery, 2)
+	mockSubInner := queuemock.NewMockSubscriber(ctrl)
+	mockSubInner.EXPECT().Subscribe(gomock.Any(), gomock.Any(), gomock.Any()).Return(deliveryChan, nil)
+	draining := make(chan struct{})
+	mockSub := &fakeDrainingSubscriber{
+		MockSubscriber: mockSubInner,
+		shutdown:       func(context.Context, string, string) error { close(draining); return nil },
+	}
+	mockQ := queuemock.NewMockQueue(ctrl)
+	mockQ.EXPECT().Subscriber().Return(mockSub).AnyTimes()
+
+	reg := newRegistry(t, mockQ, testTopicKeyStart, "test-group")
+	c := New(logger, tally.NoopScope, reg, errs.NewClassifierProcessor(), consumergatenoop.New())
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	var calls atomic.Int32
+	handler := &testController{}
+	setupController(handler, "test-handler", testTopicKeyStart, "test-group",
+		func(context.Context, Delivery) error {
+			if calls.Add(1) == 1 {
+				started <- struct{}{}
+				<-release // first delivery is in flight during drain
+				return nil
+			}
+			t.Fatal("buffered delivery must not be dispatched during drain")
+			return nil
+		},
+	)
+	require.NoError(t, c.Register(handler))
+	require.NoError(t, c.Start(context.Background()))
+
+	msg1 := entityqueue.NewMessage("m1", nil, "partition1", nil)
+	msg1.Tenant = testTenant
+	msg2 := entityqueue.NewMessage("m2", nil, "partition1", nil)
+	msg2.Tenant = testTenant
+	mockDel1 := queuemock.NewMockDelivery(ctrl)
+	done1 := setupDelivery(mockDel1, msg1, nil, nil)
+	mockDel2 := queuemock.NewMockDelivery(ctrl)
+	mockDel2.EXPECT().Message().Return(msg2).AnyTimes()
+	// Second delivery sits in the partition buffer behind the in-flight one.
+	mockDel2.EXPECT().Nack(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+	deliveryChan <- mockDel1
+	deliveryChan <- mockDel2
+	<-started
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- c.Stop(3000) }()
+	// Once the subscriber drain started, routing has stopped; finish Process.
+	<-draining
+	close(release)
+	select {
+	case <-done1:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight delivery was not acked")
+	}
+	require.NoError(t, <-stopErr)
+}
+
+func TestConsumer_StopDrain_TimeoutReturnsError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	logger := zaptest.NewLogger(t).Sugar()
+
+	deliveryChan := make(chan extqueue.Delivery)
+	mockSubInner := queuemock.NewMockSubscriber(ctrl)
+	mockSubInner.EXPECT().Subscribe(gomock.Any(), gomock.Any(), gomock.Any()).Return(deliveryChan, nil)
+	mockSub := &fakeDrainingSubscriber{
+		MockSubscriber: mockSubInner,
+		// Drain only completes when its context expires.
+		shutdown: func(ctx context.Context, _, _ string) error { <-ctx.Done(); return ctx.Err() },
+	}
+	mockQ := queuemock.NewMockQueue(ctrl)
+	mockQ.EXPECT().Subscriber().Return(mockSub).AnyTimes()
+
+	reg := newRegistry(t, mockQ, testTopicKeyStart, "test-group")
+	c := New(logger, tally.NoopScope, reg, errs.NewClassifierProcessor(), consumergatenoop.New())
+	handler := &testController{}
+	setupController(handler, "test-handler", testTopicKeyStart, "test-group", nil)
+	require.NoError(t, c.Register(handler))
+	require.NoError(t, c.Start(context.Background()))
+
+	err := c.Stop(50)
+	require.Error(t, err)
+}
+
 func TestConsumer_ObservabilityTags(t *testing.T) {
 	const topicName = "configured-test-topic"
 

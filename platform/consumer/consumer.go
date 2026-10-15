@@ -40,6 +40,10 @@ const (
 	// postponed before it redelivers and re-checks the gate (milliseconds).
 	// It bounds the release latency after a gate opens.
 	defaultGateRecheckDelayMs = int64(1000)
+
+	// abandonNackTimeout bounds the nack of a buffered delivery the
+	// framework will never dispatch during the ordered shutdown drain.
+	abandonNackTimeout = 5 * time.Second
 )
 
 // Consumer orchestrates multiple queue consumers. It handles subscription lifecycle,
@@ -81,6 +85,13 @@ type consumer struct {
 	stopped       bool
 	controllers   []Controller
 	subscriptions map[TopicKey]*activeSubscription // topicKey -> subscription
+
+	// stopCh is closed once when Stop starts the drain: consumeLoop stops
+	// routing new deliveries and in-flight processing is allowed to finish.
+	stopCh chan struct{}
+	// inFlight counts deliveries currently executing Process so Stop can
+	// wait for them (rather than cancelling their ack/nack) within budget.
+	inFlight sync.WaitGroup
 }
 
 // activeSubscription tracks the state of an active subscription.
@@ -88,6 +99,12 @@ type activeSubscription struct {
 	controller Controller
 	cancelFunc context.CancelFunc
 	done       chan struct{} // Closed when consumeLoop exits
+
+	// Backend identity, used to drive an ordered drain when the backend
+	// implements DrainingSubscriber.
+	subscriber    extqueue.Subscriber
+	topicName     string
+	consumerGroup string
 }
 
 // New creates a new consumer.
@@ -114,6 +131,7 @@ func New(logger *zap.SugaredLogger, scope tally.Scope, registry TopicRegistry, p
 		registry:           registry,
 		processor:          processor,
 		gate:               gate,
+		stopCh:             make(chan struct{}),
 		gateRecheckDelayMs: defaultGateRecheckDelayMs,
 		subscriptions:      make(map[TopicKey]*activeSubscription),
 	}
@@ -227,9 +245,12 @@ func (m *consumer) subscribe(ctx context.Context, controller Controller) error {
 	// Track active subscription
 	done := make(chan struct{})
 	sub := &activeSubscription{
-		controller: controller,
-		cancelFunc: cancel,
-		done:       done,
+		controller:    controller,
+		cancelFunc:    cancel,
+		done:          done,
+		subscriber:    subscriber,
+		topicName:     topicName,
+		consumerGroup: config.ConsumerGroup,
 	}
 	m.subscriptions[topicKey] = sub
 
@@ -291,6 +312,18 @@ func (m *consumer) consumeLoop(ctx context.Context, controller Controller, topic
 
 	for {
 		select {
+		case <-m.stopCh:
+			// Ordered drain: stop routing and nack-abandon deliveries still
+			// in the backend channel. Partition goroutines finish the
+			// in-flight Process and abandon their own buffered leftovers.
+			m.abandonDeliveries(deliveryChan)
+			m.logger.Infow("consume loop draining",
+				"controller", controller.Name(),
+				"topic_key", topicKey,
+			)
+			m.shutdownPartitions(partitionChs, &wg)
+			return
+
 		case <-ctx.Done():
 			m.logger.Infow("consume loop stopped",
 				"controller", controller.Name(),
@@ -327,11 +360,15 @@ func (m *consumer) consumeLoop(ctx context.Context, controller Controller, topic
 				}(ch)
 			}
 
-			// Send to the partition channel. If ctx is cancelled while the
-			// channel buffer is full, we exit — the undelivered message will
-			// be retried after visibility timeout.
+			// Send to the partition channel. During the ordered drain stop
+			// routing and abandon this delivery; ctx cancellation keeps the
+			// legacy hard-stop path.
 			select {
 			case ch <- delivery:
+			case <-m.stopCh:
+				m.abandonDelivery(delivery)
+				m.shutdownPartitions(partitionChs, &wg)
+				return
 			case <-ctx.Done():
 				m.shutdownPartitions(partitionChs, &wg)
 				return
@@ -386,11 +423,60 @@ func (m *consumer) shutdownPartitions(partitionChs map[entityqueue.PartitionIden
 // ensures unprocessed messages are redelivered.
 func (m *consumer) processPartition(ctx context.Context, controller Controller, deliveryCh <-chan extqueue.Delivery, scope tally.Scope) {
 	for delivery := range deliveryCh {
+		if m.stopping() {
+			// Drain began: never dispatch a buffered delivery to a
+			// controller; nack it immediately so the subscriber drain
+			// settles without waiting for its visibility timeout.
+			m.abandonDelivery(delivery)
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			m.inFlight.Add(1)
 			m.processDelivery(ctx, controller, delivery, scope)
+			m.inFlight.Done()
+		}
+	}
+}
+
+// stopping reports whether Stop has started the ordered drain.
+func (m *consumer) stopping() bool {
+	select {
+	case <-m.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// abandonDelivery nacks a delivery the framework will never dispatch
+// (buffered in either channel when Stop ran). A failed nack is harmless:
+// the message's visibility timeout redelivers it to the next owner.
+func (m *consumer) abandonDelivery(delivery extqueue.Delivery) {
+	abandonCtx, cancel := context.WithTimeout(context.Background(), abandonNackTimeout)
+	defer cancel()
+	if err := delivery.Nack(abandonCtx, failure.New("subscriber shutting down, delivery never dispatched")); err != nil {
+		m.logger.Warnw("failed to nack abandoned delivery",
+			"message_id", delivery.Message().ID,
+			"partition_key", delivery.Message().PartitionKey,
+			"error", err,
+		)
+	}
+}
+
+// abandonDeliveries drains a delivery channel, nacking every item.
+func (m *consumer) abandonDeliveries(ch <-chan extqueue.Delivery) {
+	for {
+		select {
+		case delivery, ok := <-ch:
+			if !ok {
+				return
+			}
+			m.abandonDelivery(delivery)
+		default:
+			return
 		}
 	}
 }
@@ -709,20 +795,104 @@ func controllerClassificationTags(err error) []metrics.Tag {
 // Returns error if shutdown times out.
 // Stop() is not idempotent and can only be called once.
 func (m *consumer) Stop(timeoutMs int64) error {
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancelDrain()
+
 	m.mu.Lock()
 	m.stopped = true
+	subs := make([]*activeSubscription, 0, len(m.subscriptions))
+	for _, sub := range m.subscriptions {
+		subs = append(subs, sub)
+	}
 	m.mu.Unlock()
 
 	m.logger.Infow("stopping consumer",
-		"active_subscriptions", len(m.subscriptions),
+		"active_subscriptions", len(subs),
 		"timeout_ms", timeoutMs,
 	)
 
-	err := m.unsubscribeAll(timeoutMs)
+	// Stop routing and let partition goroutines abandon buffered deliveries.
+	// Processing contexts stay alive so in-flight ack/nack calls complete.
+	close(m.stopCh)
 
+	// Drive the subscriber-side ordered drain concurrently; the queue's
+	// own Close triggers the same idempotent run.
+	type drainResult struct {
+		name string
+		err  error
+	}
+	results := make(chan drainResult, len(subs))
+	drainingCount := 0
+	for _, sub := range subs {
+		sub := sub
+		if ds, ok := sub.subscriber.(extqueue.DrainingSubscriber); ok {
+			drainingCount++
+			go func() {
+				results <- drainResult{name: sub.controller.Name(), err: ds.ShutdownSubscription(drainCtx, sub.topicName, sub.consumerGroup)}
+			}()
+		} else {
+			// Backends without ordered drain: hard-cancel as before.
+			sub.cancelFunc()
+		}
+	}
+
+	var stopErr error
+	timedOut := false
+
+	// Wait for in-flight controller processing to finish within budget.
+	inFlightDone := make(chan struct{})
+	go func() {
+		m.inFlight.Wait()
+		close(inFlightDone)
+	}()
+	select {
+	case <-inFlightDone:
+	case <-drainCtx.Done():
+		timedOut = true
+	}
+
+	// Collect subscriber drain results; each call joined the same run.
+	for i := 0; i < drainingCount; i++ {
+		select {
+		case r := <-results:
+			if r.err != nil && !errors.Is(r.err, context.Canceled) {
+				stopErr = errors.Join(stopErr, fmt.Errorf("subscription drain failed for %s: %w", r.name, r.err))
+			}
+		case <-drainCtx.Done():
+			timedOut = true
+		}
+	}
+
+	// Wait for consumeLoop/partition goroutines; hard-cancel past the deadline.
+	for topicKey, sub := range m.subscriptions {
+		select {
+		case <-sub.done:
+		case <-drainCtx.Done():
+			m.logger.Errorw("timeout waiting for controller to stop",
+				"controller", sub.controller.Name(),
+				"topic_key", topicKey,
+			)
+			sub.cancelFunc()
+			timedOut = true
+		}
+	}
+
+	if timedOut {
+		for _, sub := range m.subscriptions {
+			sub.cancelFunc()
+		}
+		stopErr = errors.Join(stopErr, fmt.Errorf("consumer stop timed out after %d ms", timeoutMs))
+	}
+
+	m.mu.Lock()
+	m.subscriptions = make(map[TopicKey]*activeSubscription)
+	m.mu.Unlock()
+
+	if stopErr == nil {
+		m.logger.Debugw("all controllers stopped gracefully")
+	}
 	m.logger.Infow("consumer stopped")
-
-	return err
+	return stopErr
 }
 
 // unsubscribeAll cancels all subscription contexts and waits for their consumeLoop
@@ -735,7 +905,8 @@ func (m *consumer) Stop(timeoutMs int64) error {
 // timeoutMs is the maximum time in milliseconds to wait for all controllers to stop.
 // Returns error on timeout, nil on success.
 func (m *consumer) unsubscribeAll(timeoutMs int64) error {
-	// Cancel all subscription contexts
+	// Start failed: hard-cancel every subscription context immediately.
+	close(m.stopCh)
 	for topicKey, sub := range m.subscriptions {
 		m.logger.Debugw("stopping controller",
 			"controller", sub.controller.Name(),

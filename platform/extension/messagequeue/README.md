@@ -29,6 +29,8 @@ type Subscriber interface {
 }
 ```
 
+A backend may additionally implement `DrainingSubscriber`. Its `ShutdownSubscription(ctx, topic, consumerGroup)` runs the backend's ordered graceful shutdown for one subscription — stop claiming, wait for in-flight deliveries to settle or safely pass their visibility deadlines, commit watermarks, release leases, deregister — so a new owner can take over partitions instead of racing a dead process. The call is idempotent and joinable: repeated or concurrent triggers join the same run, and an expired `ctx` stops waiting while the run finishes bounded by the backend's own cleanup budget. The consumer framework type-asserts it during `Stop()`; backends without it fall back to context cancellation.
+
 ### Delivery
 Message with acknowledgment operations.
 

@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -224,19 +225,18 @@ func (s *sqlmessageStore) FetchByOffset(ctx context.Context, tenant string, topi
 	return results, nil
 }
 
-// MoveToDLQ atomically moves a message to the DLQ by reinserting it with the DLQ topic name
-// The message is inserted back into queue_messages table with the DLQ topic (original + suffix)
-// This allows DLQ messages to be consumed using the normal subscriber
+// MoveToDLQAndAck atomically moves a message to the DLQ (reinserted with the
+// DLQ topic name so it is consumed by a normal subscriber on that topic) and
+// marks its per-consumer-group delivery state acked, all in one transaction.
 //
 // The failure is split across two columns: its message into last_error, so the
 // row stays readable without decoding anything, and its subjects and detail
 // into failure_detail. A failure with no structure leaves failure_detail NULL,
 // which is what an unattributed dead letter looks like.
-func (s *sqlmessageStore) MoveToDLQ(ctx context.Context, tenant string, topic string, partitionKey string, messageID string, failureCount int, f failure.Failure, dlqTopicSuffix string) (retErr error) {
-	op := metrics.Begin(s.scope, "move_to_dlq", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
+func (s *sqlmessageStore) MoveToDLQAndAck(ctx context.Context, token partitionLeaseToken, consumerGroup, tenant, topic, partitionKey, messageID string, failureCount int, f failure.Failure, dlqTopicSuffix string) (retErr error) {
+	op := metrics.Begin(s.scope, "move_to_dlq_and_ack", metrics.StorageLatencyBuckets, metrics.NewTag("topic", topic))
 	defer func() { op.Complete(retErr) }()
 
-	// Construct DLQ topic name
 	dlqTopic := topic + dlqTopicSuffix
 
 	failureDetail, err := failure.Encode(f)
@@ -255,60 +255,97 @@ func (s *sqlmessageStore) MoveToDLQ(ctx context.Context, tenant string, topic st
 	if err != nil {
 		return fmt.Errorf("begin transaction tenant=%s topic=%s message=%s: %w", tenant, topic, messageID, err)
 	}
-	defer tx.Rollback()
+	rollback := func(cause error) error {
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return fmt.Errorf("%w; rollback failed: %v", cause, rbErr)
+		}
+		return cause
+	}
 
-	// Fetch the message from main table
+	// Fetch the message from the main table, including its offset — delivery
+	// state keys ack rows by offset.
 	var (
 		payload          []byte
 		metadataJSON     []byte
 		fetchPartKey     string
 		createdAtMilli   int64
 		publishedAtMilli int64
+		offset           int64
 	)
-
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT payload, metadata, partition_key, created_at, published_at
+		SELECT payload, metadata, partition_key, created_at, published_at, offset
 		FROM %s
 		WHERE tenant = ? AND topic = ? AND partition_key = ? AND id = ?
-	`, MessagesTableName), tenant, topic, partitionKey, messageID).Scan(&payload, &metadataJSON, &fetchPartKey, &createdAtMilli, &publishedAtMilli)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Message already deleted or doesn't exist
-			s.logger.Debugw("message not found for DLQ move",
-				logTenant, tenant,
-				logTopic, topic,
-				logMessageID, messageID,
-			)
-			return nil
+	`, MessagesTableName), tenant, topic, partitionKey, messageID).Scan(&payload, &metadataJSON, &fetchPartKey, &createdAtMilli, &publishedAtMilli, &offset)
+	if err == sql.ErrNoRows {
+		// Already moved by a prior (committed) attempt: replay is a no-op.
+		s.logger.Debugw("message not found for DLQ move, treating as already moved",
+			logTenant, tenant,
+			logTopic, topic,
+			logMessageID, messageID,
+		)
+		if commitErr := tx.Commit(); commitErr != nil {
+			return fmt.Errorf("commit idempotent DLQ move tenant=%s topic=%s message=%s: %w", tenant, topic, messageID, commitErr)
 		}
-		return fmt.Errorf("fetch message for DLQ tenant=%s topic=%s partition=%s message=%s: %w", tenant, topic, partitionKey, messageID, err)
+		return nil
+	}
+	if err != nil {
+		return rollback(fmt.Errorf("fetch message for DLQ tenant=%s topic=%s partition=%s message=%s: %w", tenant, topic, partitionKey, messageID, err))
 	}
 
-	// Insert into queue_messages table with DLQ topic name and DLQ-specific fields.
+	// Upsert the DLQ copy. The unique key is (tenant, DLQ topic, partition, id),
+	// so a replay of this move updates rather than duplicating.
 	now := time.Now().UnixMilli()
-	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (tenant, topic, id, payload, metadata, partition_key, created_at, published_at, failed_at, failure_count, last_error, original_topic, failure_detail)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, MessagesTableName), tenant, dlqTopic, messageID, payload, metadataJSON, fetchPartKey, createdAtMilli, publishedAtMilli, now, failureCount, f.Message, topic, failureDetailArg)
-
-	if err != nil {
-		return fmt.Errorf("insert into DLQ tenant=%s topic=%s dlq=%s partition=%s message=%s: %w", tenant, topic, dlqTopic, partitionKey, messageID, err)
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (tenant, topic, id, payload, metadata, partition_key, created_at, published_at, failed_at, failure_count, last_error, original_topic, failure_detail, failed)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE
+		ON DUPLICATE KEY UPDATE
+			failed = TRUE,
+			payload = VALUES(payload),
+			metadata = VALUES(metadata),
+			failed_at = VALUES(failed_at),
+			failure_count = GREATEST(VALUES(failure_count), failure_count),
+			last_error = VALUES(last_error),
+			original_topic = VALUES(original_topic),
+			failure_detail = VALUES(failure_detail)
+	`, MessagesTableName),
+		tenant, dlqTopic, messageID, payload, metadataJSON, fetchPartKey, createdAtMilli, publishedAtMilli,
+		now, failureCount, f.Message, topic, failureDetailArg,
+	); err != nil {
+		return rollback(fmt.Errorf("insert into DLQ tenant=%s topic=%s dlq=%s partition=%s message=%s: %w", tenant, topic, dlqTopic, partitionKey, messageID, err))
 	}
 
-	// Delete from original topic
-	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		DELETE FROM %s WHERE tenant = ? AND topic = ? AND partition_key = ? AND id = ?
-	`, MessagesTableName), tenant, topic, partitionKey, messageID)
+	`, MessagesTableName), tenant, topic, fetchPartKey, messageID); err != nil {
+		return rollback(fmt.Errorf("delete from main table tenant=%s topic=%s partition=%s message=%s: %w", tenant, topic, partitionKey, messageID, err))
+	}
 
+	// Ack inside the same transaction, conditioned on the lease token.
+	ackResult, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (tenant, consumer_group, topic, partition_key, message_offset, acked, invisible_until, retry_count)
+		SELECT ?, ?, ?, ?, ?, TRUE, 0, 0
+		WHERE %s
+		ON DUPLICATE KEY UPDATE acked = TRUE
+	`, DeliveryStateTableName, leaseGuardSQL),
+		append([]any{tenant, consumerGroup, topic, fetchPartKey, offset},
+			leaseGuardArgs(token, tenant, consumerGroup, topic, fetchPartKey)...)...)
 	if err != nil {
-		return fmt.Errorf("delete from main table tenant=%s topic=%s partition=%s message=%s: %w", tenant, topic, partitionKey, messageID, err)
+		return rollback(fmt.Errorf("mark acked with DLQ move tenant=%s topic=%s message=%s: %w", tenant, topic, messageID, err))
+	}
+	if rows, raErr := ackResult.RowsAffected(); raErr == nil && rows == 0 {
+		owned, ownErr := leaseStillOwned(ctx, tx, token, tenant, consumerGroup, topic, fetchPartKey)
+		if ownErr != nil {
+			return rollback(fmt.Errorf("recheck lease ownership tenant=%s topic=%s message=%s: %w", tenant, topic, messageID, ownErr))
+		}
+		if !owned {
+			return rollback(fencedWriteError(token, tenant, topic, fetchPartKey))
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit DLQ transaction tenant=%s topic=%s message=%s: %w", tenant, topic, messageID, err)
 	}
-
 	return nil
 }
 

@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "每个分区 worker 和 Delivery 绑定租约代际，失去所有权后不能再写 delivery state 或水位。"
+  - id: 2
+    type: f2p
+    text: "关闭先停止获取和投递新消息，再对已经交付的消息执行有界排空。"
+  - id: 3
+    type: f2p
+    text: "Ack、Nack 和 Postpone 只有当前 owner 可提交，失锁交错不会错误推进水位或清除屏障。"
+  - id: 4
+    type: f2p
+    text: "连续已确认消息推进水位，postponed 或仍在途的消息继续阻挡该分区越过自身。"
+  - id: 5
+    type: f2p
+    text: "DLQ 已写而 Ack 失败时恢复只补确认状态，不重复插入 DLQ 或丢失原消息事实。"
+  - id: 6
+    type: f2p
+    text: "租约续约失败或关闭超时会留下可由新 owner 接管的持久状态，不保留无界后台 supervisor。"
+  - id: 7
+    type: f2p
+    text: "worker 停止后释放租约并注销 heartbeat，新 owner 从可见性、重试计数和水位继续处理。"
+  - id: 8
+    type: p2p
+    text: "重复 Close、空订阅、正常 rebalance 和至少一次投递语义保持兼容。"

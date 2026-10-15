@@ -191,11 +191,14 @@ See `platform/extension/messagequeue/mysql/schema/queue_delivery_state.sql` for 
 **Key Fields:**
 - `consumer_group`, `topic`, `partition_key` (PK): Identifies which partition is leased
 - `leased_by`: Worker that owns the lease
+- `lease_generation`: Fencing epoch, 1 on first acquisition and incremented by one whenever a different subscriber steals a stale lease; renewal by the current owner leaves it unchanged
 - `leased_at`, `lease_renewed_at`: Lease timestamps for staleness detection
 
 **Indexes:**
 - `(leased_by)`: Find all partitions owned by a worker
 - `(lease_renewed_at)`: Detect stale leases across workers
+
+`(leased_by, lease_generation)` is the owner's fencing token. A partition worker captures the generation when it starts and every owner-scoped write — visibility claim, ack/nack/postpone, visibility extension, watermark advance, lease renewal and release, and the DLQ move — carries an `EXISTS` guard matching the token. A write after the lease moved matches no rows; a follow-up ownership read classifies the zero-row result as either a legitimate no-op while still owning or `ErrLeaseFenced`. A fenced worker exits without releasing the lease, and the stale delivery is redelivered to the current owner when its visibility expires, so an old owner with an in-flight delivery cannot mutate a partition it lost.
 
 See `platform/extension/messagequeue/mysql/schema/queue_partition_leases.sql` for full schema.
 
@@ -225,11 +228,13 @@ See `platform/extension/messagequeue/mysql/schema/queue_subscriber_heartbeats.sq
 
 DLQ messages are stored in the same `queue_messages` table under a different topic name (original topic + DLQ suffix, e.g., `land_queue_dlq`). This allows DLQ messages to be consumed using the normal subscriber with the DLQ topic name. DLQ-specific fields (`failed_at`, `failure_count`, `last_error`, `original_topic`) are populated when a message is moved to DLQ; they are zero/empty for normal messages.
 
+The move is one transaction (`MoveToDLQAndAck`): insert the DLQ copy, delete the main-topic row, and mark the consumer group's delivery state acked — the final write conditioned on the owner's fencing token. A zero-row guarded ack rolls the whole move back, so a stale owner never dead-letters a message on a partition it lost, and a crashed move never leaves the row in both topics or in neither.
+
 ## Message Flow
 
 **1. Publish** — Insert messages into `queue_messages` with AUTO_INCREMENT offset
 
-**2. Lease Acquisition** — `INSERT ... ON DUPLICATE KEY UPDATE` with stale lease detection
+**2. Lease Acquisition** — `INSERT ... ON DUPLICATE KEY UPDATE` with stale lease detection; the read-back returns the row's `lease_generation`, which the worker carries as its fencing token for every later write
 
 **3. Fetch** — Read from immutable log: `SELECT ... WHERE topic=? AND partition_key=? AND offset > ?`
 
@@ -247,7 +252,9 @@ DLQ messages are stored in the same `queue_messages` table under a different top
 
 **7. Nack** — Set `invisible_until = now`; the message is immediately eligible for redelivery (the visibility timeout is what spaces retries)
 
-**8. DLQ** — If `retry_count >= MaxAttempts`: atomically move message to DLQ topic (INSERT with DLQ topic + DELETE from original topic in transaction). MoveToDLQ must succeed before marking acked — otherwise the message would be lost from both main queue and DLQ.
+**8. DLQ** — If `retry_count >= MaxAttempts`: atomically move message to DLQ topic (INSERT with DLQ topic + DELETE from original topic + guarded delivery-state ack in one transaction). MoveToDLQ must succeed before marking acked — otherwise the message would be lost from both main queue and DLQ.
+
+All mutating steps from 5 onward (mark delivered, extend visibility, ack/nack/postpone, watermark advance, lease renewal and release, and the DLQ move) carry the owner's fencing token: their `WHERE` includes an `EXISTS` match on `(leased_by, lease_generation)`, so a write by an owner that lost the partition matches no rows and fails as `ErrLeaseFenced` without taking effect.
 
 **9. Garbage Collection** — Delete messages where `offset <= MIN(offset_acked)` across all consumer groups
 
@@ -323,9 +330,11 @@ Messages are never silently lost. Every deletion path has explicit guards:
 **What happens:**
 1. Delivery state has `invisible_until = crash_time + VisibilityTimeout`
 2. After timeout expires, message becomes deliverable again
-3. Another worker detects stale lease and steals partition
+3. Another worker detects stale lease and steals partition at a new `lease_generation`
 4. Message is redelivered (at-least-once guarantee)
 5. `retry_count` increment on redelivery prevents infinite retries
+
+The same sequence covers a worker that is alive but slow or partitioned rather than dead: its lease is stolen at a new generation, every guarded write it still attempts returns `ErrLeaseFenced`, and its worker exits without releasing the lease. The stale delivery it holds can neither ack nor postpone past the new owner; when its visibility expires the current owner redelivers it, exactly once in committed effect.
 
 **Scenario:** Worker crashes after ack but before watermark update
 
@@ -353,7 +362,7 @@ Subscribers send periodic heartbeats to `queue_subscriber_heartbeats`. The fair 
 4. Cap lease acquisitions at `maxPartitions`
 5. On each lease renewal tick, if this subscriber holds more than `maxPartitions`, release excess (sorted deterministically so the same partitions are released across runs)
 
-**Graceful shutdown:** Subscribers deregister their heartbeat and release all leases, enabling immediate redistribution.
+**Graceful shutdown:** Shutdown is an ordered drain, not an immediate cancel, exposed as `DrainingSubscriber.ShutdownSubscription` and driven by `Close()` and the consumer framework's `Stop()`: stop claiming new messages, wait for in-flight deliveries to settle or safely pass their visibility deadline, commit the final watermark, release the leases of fully drained partitions with their fencing generation, and deregister the heartbeat. Partitions still carrying deliveries when the drain deadline expires keep their leases, so another subscriber takes them over; the drain's cleanup runs on bounded contexts and never outlives shutdown as an unbounded background task. This bounds redistribution latency without losing in-flight work or racing the new owner.
 
 **Failure:** If fair share computation fails (heartbeat store error, discovery error), the subscriber falls back to unlimited acquisition — ensuring availability over perfect fairness.
 

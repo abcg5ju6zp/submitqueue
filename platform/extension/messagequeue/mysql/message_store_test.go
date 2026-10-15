@@ -156,11 +156,7 @@ func TestMessageStore_FetchByOffset(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestMessageStore_MoveToDLQ(t *testing.T) {
-	db, mock, store := setupmessageStoreTest(t)
-	defer db.Close()
-
-	ctx := context.Background()
+func TestMessageStore_MoveToDLQAndAck(t *testing.T) {
 	topic := "test_topic"
 	partitionKey := "part1"
 	messageID := "msg1"
@@ -168,66 +164,93 @@ func TestMessageStore_MoveToDLQ(t *testing.T) {
 	lastError := "test error"
 	dlqTopicSuffix := "_dlq"
 	dlqTopic := topic + dlqTopicSuffix
+	token := partitionLeaseToken{leasedBy: testSubscriberName, generation: 2}
 
-	// Expect transaction begin
-	mock.ExpectBegin()
+	expectFetch := func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT (.+) FROM queue_messages").
+			WithArgs(testTenant, topic, partitionKey, messageID).
+			WillReturnRows(sqlmock.NewRows([]string{"payload", "metadata", "partition_key", "created_at", "published_at", "offset"}).
+				AddRow([]byte("payload1"), []byte(`{"key":"value"}`), "part1", time.Now().UnixMilli(), time.Now().UnixMilli(), int64(7)))
+	}
+	expectMoveAndAck := func(mock sqlmock.Sqlmock, lastErrorArg, detailArg any, ackRows int64) {
+		mock.ExpectExec("INSERT INTO queue_messages").
+			WithArgs(testTenant, dlqTopic, messageID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), failureCount, lastErrorArg, topic, detailArg).
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectExec("DELETE FROM queue_messages").
+			WithArgs(testTenant, topic, partitionKey, messageID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec("INSERT INTO queue_delivery_state").
+			WithArgs(testTenant, testConsumerGroup, topic, partitionKey, int64(7),
+				testTenant, testConsumerGroup, topic, partitionKey, testSubscriberName, int64(2)).
+			WillReturnResult(sqlmock.NewResult(0, ackRows))
+	}
 
-	// Mock query for fetching message (now includes partition_key in WHERE)
-	rows := sqlmock.NewRows([]string{"payload", "metadata", "partition_key", "created_at", "published_at"}).
-		AddRow([]byte("payload1"), []byte(`{"key":"value"}`), "part1", time.Now().UnixMilli(), time.Now().UnixMilli())
+	t.Run("moves and acks in one transaction", func(t *testing.T) {
+		db, mock, store := setupmessageStoreTest(t)
+		defer db.Close()
 
-	mock.ExpectQuery("SELECT (.+) FROM queue_messages").
-		WithArgs(testTenant, topic, partitionKey, messageID).
-		WillReturnRows(rows)
+		mock.ExpectBegin()
+		expectFetch(mock)
+		expectMoveAndAck(mock, lastError, nil, 1)
+		mock.ExpectCommit()
 
-	// Expect insert into queue_messages with DLQ topic. The failure's message
-	// goes to last_error; failure_detail is NULL because this failure names no
-	// subjects — see TestMessageStore_MoveToDLQ_WritesFailureDetail.
-	mock.ExpectExec("INSERT INTO queue_messages").
-		WithArgs(testTenant, dlqTopic, messageID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), failureCount, lastError, topic, nil).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		err := store.MoveToDLQAndAck(context.Background(), token, testConsumerGroup, testTenant, topic, partitionKey, messageID, failureCount, failure.New(lastError), dlqTopicSuffix)
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 
-	// Expect delete from main table (now includes partition_key in WHERE)
-	mock.ExpectExec("DELETE FROM queue_messages").
-		WithArgs(testTenant, topic, partitionKey, messageID).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The structured half of a failure is what lets a DLQ consumer act on the
+	// right entity, so it has to reach the row rather than flattened prose.
+	t.Run("writes structured failure detail", func(t *testing.T) {
+		db, mock, store := setupmessageStoreTest(t)
+		defer db.Close()
 
-	// Expect commit
-	mock.ExpectCommit()
+		f := failure.New("speculator failed", failure.Subject{Type: "queue", ID: "test-queue"})
+		encoded, err := failure.Encode(f)
+		require.NoError(t, err)
 
-	err := store.MoveToDLQ(ctx, testTenant, topic, partitionKey, messageID, failureCount, failure.New(lastError), dlqTopicSuffix)
-	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet())
-}
+		mock.ExpectBegin()
+		expectFetch(mock)
+		expectMoveAndAck(mock, "speculator failed", encoded, 1)
+		mock.ExpectCommit()
 
-// The structured half of a failure is what lets a DLQ consumer act on the right
-// entity, so it has to reach the row rather than being flattened into prose.
-func TestMessageStore_MoveToDLQ_WritesFailureDetail(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	defer db.Close()
+		require.NoError(t, store.MoveToDLQAndAck(context.Background(), token, testConsumerGroup, testTenant, topic, partitionKey, messageID, failureCount, f, dlqTopicSuffix))
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 
-	store := newMessageStore(db, zaptest.NewLogger(t).Sugar(), tally.NoopScope)
+	t.Run("missing main row is an idempotent no-op", func(t *testing.T) {
+		db, mock, store := setupmessageStoreTest(t)
+		defer db.Close()
 
-	f := failure.New("speculator failed", failure.Subject{Type: "queue", ID: "test-queue"})
-	encoded, err := failure.Encode(f)
-	require.NoError(t, err)
+		mock.ExpectBegin()
+		mock.ExpectQuery("SELECT (.+) FROM queue_messages").
+			WithArgs(testTenant, topic, partitionKey, messageID).
+			WillReturnRows(sqlmock.NewRows([]string{"payload", "metadata", "partition_key", "created_at", "published_at", "offset"}))
+		mock.ExpectCommit()
 
-	mock.ExpectBegin()
-	mock.ExpectQuery("SELECT (.+) FROM queue_messages").
-		WithArgs(testTenant, "test_topic", "part1", "msg1").
-		WillReturnRows(sqlmock.NewRows([]string{"payload", "metadata", "partition_key", "created_at", "published_at"}).
-			AddRow([]byte("payload1"), nil, "part1", int64(1), int64(2)))
-	mock.ExpectExec("INSERT INTO queue_messages").
-		WithArgs(testTenant, "test_topic_dlq", "msg1", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 3, "speculator failed", "test_topic", encoded).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec("DELETE FROM queue_messages").
-		WithArgs(testTenant, "test_topic", "part1", "msg1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
+		err := store.MoveToDLQAndAck(context.Background(), token, testConsumerGroup, testTenant, topic, partitionKey, messageID, failureCount, failure.New(lastError), dlqTopicSuffix)
+		require.NoError(t, err)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 
-	require.NoError(t, store.MoveToDLQ(context.Background(), testTenant, "test_topic", "part1", "msg1", 3, f, "_dlq"))
-	require.NoError(t, mock.ExpectationsWereMet())
+	t.Run("stale fencing token rolls the move back", func(t *testing.T) {
+		db, mock, store := setupmessageStoreTest(t)
+		defer db.Close()
+
+		mock.ExpectBegin()
+		expectFetch(mock)
+		expectMoveAndAck(mock, lastError, nil, 0)
+		// Guarded ack matches no rows and the lease no longer matches: rollback.
+		mock.ExpectQuery("SELECT 1 FROM queue_partition_leases").
+			WithArgs(testTenant, testConsumerGroup, topic, partitionKey, testSubscriberName, int64(2)).
+			WillReturnRows(sqlmock.NewRows([]string{"1"}))
+		mock.ExpectRollback()
+
+		err := store.MoveToDLQAndAck(context.Background(), token, testConsumerGroup, testTenant, topic, partitionKey, messageID, failureCount, failure.New(lastError), dlqTopicSuffix)
+		var fenced *ErrLeaseFenced
+		require.ErrorAs(t, err, &fenced)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 }
 
 func TestMessageStore_GetOffsetsAbove(t *testing.T) {
