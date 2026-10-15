@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "同一 queue 和 URI 的摄取重试使用稳定请求代际，不会创建第二个 Request 或接纳事实。"
+  - id: 2
+    type: f2p
+    text: "Request、URI 映射和接纳记录部分缺失时只补缺口，已有权威字段不会被重置。"
+  - id: 3
+    type: f2p
+    text: "队列 latest 指针按请求代际条件推进，迟到旧摄取不能覆盖较新请求。"
+  - id: 4
+    type: f2p
+    text: "process 与 build 消息使用稳定身份，发布响应不确定或重投不会重复触发外部构建。"
+  - id: 5
+    type: f2p
+    text: "构建结果和验证事实关联同一 Request 与 Build，重复 signal 不产生冲突事实。"
+  - id: 6
+    type: f2p
+    text: "record、日志或摘要物化失败时只补下游可查询事实，不重新执行 process 或 build。"
+  - id: 7
+    type: f2p
+    text: "进程重启和 DLQ 恢复依据持久阶段继续，状态查询不会暴露互相矛盾的摘要与历史。"
+  - id: 8
+    type: p2p
+    text: "已有完整请求的幂等返回、不同 URI、明确构建失败和分页查询保持兼容。"

@@ -86,11 +86,14 @@ func NewIngestController(
 // request ID validating it.
 //
 // It is idempotent and runs to completion on every call, each step tolerant of having already
-// run: it resolves (or claims) the (queue, URI) mapping, ensures the Request row and accepted log
-// entry exist, and publishes the request to the process stage. A retry after a partial failure —
-// for example the URI mapping committed but the request write failed — completes the missing
-// steps instead of returning a dangling reference. The (queue, URI) mapping is the dedup gate,
-// so concurrent ingests of the same head converge on one request.
+// run: it resolves (or claims) the (queue, URI) mapping, ensures the Request row exists, ensures
+// the v1 accepted occurrence (and the summary and acceptance mapping projected from it) exists,
+// advances the queue's latest pointer, and publishes the request to process while it is still
+// accepted. A retry after a partial failure — the mapping committed but the request write
+// failed, or a request that advanced while its accepted occurrence or one of its projections
+// was missing — completes only the missing steps instead of returning a dangling reference, and
+// never rewrites the authoritative Request. The (queue, URI) mapping is the dedup gate, so
+// concurrent ingests of the same head converge on one request.
 func (c *IngestController) Ingest(ctx context.Context, req entity.IngestRequest) (result entity.IngestResult, retErr error) {
 	const opName = "ingest"
 
@@ -138,11 +141,20 @@ func (c *IngestController) Ingest(ctx context.Context, req entity.IngestRequest)
 		return entity.IngestResult{}, err
 	}
 
-	if request.State == entity.RequestStateAccepted {
-		log := requestlog.NewRequestStateLog(request, entity.RequestOutcomeReasonUnknown)
-		if err := c.materializer.PersistLog(ctx, store, log); err != nil {
-			return entity.IngestResult{}, fmt.Errorf("failed to record accepted state for request %s: %w", id, err)
-		}
+	// Ensure the v1 accepted occurrence regardless of the request's current state: that
+	// occurrence is the source of the summary's AcceptedAtMs and the acceptance mapping List
+	// paginates over, so a request that advanced without it must heal when its head is
+	// re-reported. Persist-before-publish means a normally flowing request already has it, in
+	// which case PersistLog reconciles identical-existing and re-runs the projections. The
+	// authoritative Request is never updated here — this is the historical v1 view only.
+	acceptedView := request
+	acceptedView.State = entity.RequestStateAccepted
+	acceptedView.BuildStrategy = entity.BuildStrategyUnknown
+	acceptedView.BaseURI = ""
+	acceptedView.Version = 1
+	acceptedLog := requestlog.NewRequestStateLog(acceptedView, entity.RequestOutcomeReasonUnknown)
+	if err := c.materializer.PersistLog(ctx, store, acceptedLog); err != nil {
+		return entity.IngestResult{}, fmt.Errorf("failed to record accepted state for request %s: %w", id, err)
 	}
 
 	if err := c.advanceQueueLatestRequestID(ctx, store, queue, id); err != nil {

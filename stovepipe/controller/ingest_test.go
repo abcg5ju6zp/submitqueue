@@ -111,6 +111,19 @@ func acceptedRequest(id string) entity.Request {
 	}
 }
 
+// advancedRequest returns a request that has moved past accepted while carrying admit and
+// terminal facts. Healing must retain the plain accepted/v1 occurrence without leaking any of
+// these later fields into it.
+func advancedRequest(id string, state entity.RequestState) entity.Request {
+	req := acceptedRequest(id)
+	req.State = state
+	req.BuildStrategy = entity.BuildStrategyIncrementalSinceGreen
+	req.BaseURI = "git://repo/monorepo/main/base"
+	req.TerminalBuildID = "bk-1"
+	req.Version = 3
+	return req
+}
+
 func expectMaterializeAccepted(m ingestMocks, id string) {
 	m.materializer.EXPECT().PersistLog(
 		gomock.Any(),
@@ -257,6 +270,113 @@ func TestIngestController_Ingest(t *testing.T) {
 				m.publisher.EXPECT().Publish(gomock.Any(), "process", gomock.Any()).Return(nil)
 			},
 			wantID: "3",
+		},
+		{
+			name:  "older decimal candidate does not move latest back but still announces an accepted head",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				expectResolve(m)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), testURI).Return("7", nil)
+				m.reqStore.EXPECT().Get(gomock.Any(), "7").Return(acceptedRequest("7"), nil)
+				expectMaterializeAccepted(m, "7")
+				m.queueStore.EXPECT().Get(gomock.Any(), testQueue).Return(entity.Queue{
+					Name: testQueue, LatestRequestID: "10", Version: 1,
+				}, nil)
+				// Process coalesces the stale accepted head against latest=10 and supersedes it;
+				// only the pointer update is forbidden.
+				m.publisher.EXPECT().Publish(gomock.Any(), "process", gomock.Any()).Return(nil)
+			},
+			wantID: "7",
+		},
+		{
+			name:  "pointer cas mismatch retries and then concedes to a newer concurrent pointer",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				expectResolve(m)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), testURI).Return("7", nil)
+				m.reqStore.EXPECT().Get(gomock.Any(), "7").Return(acceptedRequest("7"), nil)
+				expectMaterializeAccepted(m, "7")
+				gomock.InOrder(
+					m.queueStore.EXPECT().Get(gomock.Any(), testQueue).Return(entity.Queue{
+						Name: testQueue, LatestRequestID: "5", Version: 1,
+					}, nil),
+					m.queueStore.EXPECT().Update(gomock.Any(),
+						entity.Queue{Name: testQueue, LatestRequestID: "7", Version: 1}, int32(1), int32(2),
+					).Return(storage.ErrVersionMismatch),
+					m.queueStore.EXPECT().Get(gomock.Any(), testQueue).Return(entity.Queue{
+						Name: testQueue, LatestRequestID: "9", Version: 3,
+					}, nil),
+				)
+				// The concurrent writer advanced the generation; the stale accepted head is still
+				// announced once for process to supersede, but the pointer is never written back.
+				m.publisher.EXPECT().Publish(gomock.Any(), "process", gomock.Any()).Return(nil)
+			},
+			wantID: "7",
+		},
+		{
+			name:  "processing request heals accepted occurrence without republishing",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				expectResolve(m)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), testURI).Return("5", nil)
+				m.reqStore.EXPECT().Get(gomock.Any(), "5").Return(advancedRequest("5", entity.RequestStateProcessing), nil)
+				expectMaterializeAccepted(m, "5")
+				expectAdvanceLatestRequestIDNoOp(m, testQueue, "5")
+			},
+			wantID: "5",
+		},
+		{
+			name:  "terminal request heals accepted occurrence without republishing",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				expectResolve(m)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), testURI).Return("5", nil)
+				m.reqStore.EXPECT().Get(gomock.Any(), "5").Return(advancedRequest("5", entity.RequestStateSucceeded), nil)
+				expectMaterializeAccepted(m, "5")
+				expectAdvanceLatestRequestIDNoOp(m, testQueue, "5")
+			},
+			wantID: "5",
+		},
+		{
+			name:  "advanced request with missing latest pointer only fills the pointer",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				expectResolve(m)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), testURI).Return("6", nil)
+				m.reqStore.EXPECT().Get(gomock.Any(), "6").Return(advancedRequest("6", entity.RequestStateFailed), nil)
+				expectMaterializeAccepted(m, "6")
+				expectAdvanceLatestRequestID(m, testQueue, "6")
+			},
+			wantID: "6",
+		},
+		{
+			name:  "new head uri mints a new request and advances the pointer",
+			queue: testQueue,
+			setup: func(m ingestMocks) {
+				const newerURI = "git://repo/monorepo/main/def456"
+				m.factory.EXPECT().For(sourcecontrol.Config{QueueName: testQueue}).Return(m.sc, nil)
+				m.sc.EXPECT().Latest(gomock.Any()).Return(newerURI, nil)
+				m.uriStore.EXPECT().GetIDByURI(gomock.Any(), newerURI).Return("", storage.ErrNotFound)
+				m.counter.EXPECT().Next(gomock.Any(), counterDomainRequest).Return(int64(8), nil)
+				m.uriStore.EXPECT().Create(gomock.Any(), newerURI, "8").Return(nil)
+				expected := entity.Request{
+					ID: "8", Queue: testQueue, URI: newerURI,
+					State: entity.RequestStateAccepted, Version: 1,
+				}
+				m.reqStore.EXPECT().Get(gomock.Any(), "8").Return(entity.Request{}, storage.ErrNotFound)
+				m.reqStore.EXPECT().Create(gomock.Any(), expected).Return(nil)
+				m.materializer.EXPECT().PersistLog(
+					gomock.Any(), m.store,
+					requestlog.NewRequestStateLog(expected, entity.RequestOutcomeReasonUnknown),
+				).Return(nil)
+				m.queueStore.EXPECT().Get(gomock.Any(), testQueue).Return(entity.Queue{
+					Name: testQueue, LatestRequestID: "7", Version: 2,
+				}, nil)
+				m.queueStore.EXPECT().Update(gomock.Any(),
+					entity.Queue{Name: testQueue, LatestRequestID: "8", Version: 2}, int32(2), int32(3)).Return(nil)
+				m.publisher.EXPECT().Publish(gomock.Any(), "process", gomock.Any()).Return(nil)
+			},
+			wantID: "8",
 		},
 		{
 			name:        "empty queue is invalid",

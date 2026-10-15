@@ -100,7 +100,7 @@ Enums are strings with unknown sentinels, and the entity has no storage or trans
 
 The core column shape follows SubmitQueue's `RequestLog`, except Stovepipe omits SubmitQueue's redundant `Type` column. Context that is meaningful only for one occurrence kind remains in the JSON metadata map instead of adding sparse columns.
 
-Metadata is never used for occurrence identity, filtering, or control flow. Nil and empty maps are equivalent. The initial entity and storage contract treats the map as opaque JSON; writer and projection work may later define and enforce keys such as `superseded_by_request_id`, `build_id`, and `fact_degree`. Producers must not store credentials, raw dependency errors, stack traces, or unbounded payloads. The initial public history API does not expose the raw map.
+Metadata is never used for occurrence identity or filtering. Nil and empty maps are equivalent. Defined keys may carry bounded context a repair path needs to act on: the build stage reads `build_id` from the retained `build_triggered` occurrence to resume that build on redelivery rather than triggering a replacement, so that one key is part of the control flow (its writer always populates it; an occurrence without it contributes no resume result). The initial entity and storage contract otherwise treats the map as opaque JSON; writer and projection work may later define and enforce further keys such as `superseded_by_request_id` and `fact_degree`. Producers must not store credentials, raw dependency errors, stack traces, or unbounded payloads. The initial public history API does not expose the raw map.
 
 Immutable Request context such as URI, build strategy, base URI, and terminal build id remains on `Request` and is resolved there rather than copied into log records or history responses. Build status and version remain on `Build`; the triggered and finished event kinds plus the terminal Request state describe the lifecycle without duplicating Build snapshots. When a build established the terminal state, that state entry records its id as occurrence context. Diagnostic error codes remain in structured logs until a concrete public vocabulary is required.
 
@@ -208,13 +208,13 @@ Request creation, Build changes, and fact creation use the same source-write, lo
 
 | Owner | Source operation and retained log | Retry repair |
 |---|---|---|
-| Ingest | Create accepted Request, then retain accepted. | An existing Request ensures accepted before process publication. |
+| Ingest | Create accepted Request, then retain accepted. | Every ingest call unconditionally ensures the v1 accepted occurrence, so an existing Request at any state heals a missing accepted entry, summary acceptance time, or acceptance mapping before the latest-pointer advance and process publication. (A v1 entry retained late for a legacy row that advanced without one takes the healing time; persist-before-publish means normally flowing requests always retain theirs at admission.) |
 | Process | CAS to superseded or processing, then retain that state. | An existing state is reconstructed from Request context before ack or build publication. |
-| Build | Create Build after runner acceptance, then retain `build_triggered`. | An identical existing Build ensures the event before buildsignal publication. |
+| Build | Create Build after runner acceptance, then retain `build_triggered`. | The retained trigger is also the request -> build index: a redelivery finds it via the per-request List, loads that Build, and re-publishes buildsignal instead of triggering again; an identical existing Build ensures the event before buildsignal publication. |
 | Buildsignal | Persist terminal Build and retain `build_finished`; CAS the Request outcome and retain its terminal state. | Existing terminal Build and Request outcome each ensure their own entry before record publication. |
 | Record | Create or verify the whole-repository fact, then retain `validation_fact_recorded`; after recording project facts, retain one `project_facts_recorded` event. | An identical whole-repository fact and project-fact batch ensure their events before bookmark or promotion work. |
 | Record DLQ | Retain `record_abandoned`, then acknowledge the remaining record work. | The stable event ID makes history retention idempotent without replaying facts, bookmarks, promotion, or hooks. |
-| Reconciler | CAS an unrecoverable non-terminal Request to failed, then retain failed. | An existing terminal Request is repaired from its persisted outcome without relabeling it. |
+| Build DLQ | Re-publish buildsignal when the trigger occurrence and Build row are durable; otherwise CAS an unrecoverable non-terminal Request to failed, then retain failed. | Resume from the persisted stage when its facts are complete; an existing terminal Request is repaired from its persisted outcome without relabeling it. |
 
 Build running and unchanged polls create no entry. A failed runner trigger that creates no Build creates no event. Cancelled and superseded requests create no validation fact.
 
@@ -224,7 +224,7 @@ No controller infers an outcome reason from `RequestStateFailed` alone, invents 
 
 Every writer retains a retry trigger until the request-log write succeeds. A queue stage retries its delivery, or its DLQ reconciler repairs the log and republishes the original handoff. A log or publish failure after a source transition never forces a different outcome.
 
-Stages without a suitable DLQ reconciler add one or use a subscription policy that cannot discard the only repair trigger. Ingest relies on caller retry of the same `(queue, URI)` to complete an accepted Request whose log or process publication failed.
+Stages without a suitable DLQ reconciler add one or use a subscription policy that cannot discard the only repair trigger. Ingest relies on caller retry of the same `(queue, URI)`: every call unconditionally ensures the v1 accepted occurrence and its projections, and completes an accepted Request whose process publication failed, regardless of the state the request has since reached.
 
 This is rollout work, not deferred cleanup: a mandatory request log without a durable repair trigger could turn a store outage into silently stranded pipeline work.
 

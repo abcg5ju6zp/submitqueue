@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "build_trigger.go",
         "materializer.go",
         "request_acceptance.go",
         "request_summary.go",
@@ -21,6 +22,7 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "build_trigger_test.go",
         "materializer_test.go",
         "request_acceptance_test.go",
         "request_summary_test.go",

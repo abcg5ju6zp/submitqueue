@@ -10,11 +10,11 @@ It handles only the trigger: it does not poll for completion, record greenness, 
 
 `build` consumes a request id, published by `process` in Phase 1 (see [workflow.md](../workflow.md#workflow)). Both phases drive the same `build` → `buildsignal` machinery against the same `Request` row. The `process`/`analyze` → `build` topic is partitioned by **request id**; see [Partitioning](#partitioning) for the full rationale, including why `build` → `buildsignal` partitions finer (by build id) than SubmitQueue's equivalent topic.
 
-**`build` is not the sole writer of the rows it touches, and its own writes are narrow.** On `Request`, `build` never writes at all — it only reads the `BuildStrategy`/`BaseURI`/`URI` fields `process` set at admit, and it leaves `Request.State` untouched at `processing` throughout (`process`, `buildsignal`, and the DLQ reconciler are `Request.State`'s only writers). On `Build`, `build` is the sole creator — it calls `BuildStore.Create` exactly once, at step 6 — and never mutates the row again; `buildsignal` is the sole writer of `Build.Status`/`Build.Version` afterward (see [buildsignal.md](buildsignal.md#input-and-re-entrancy)). This division is why `build` never needs a CAS/version write of its own: `Create` is the only storage mutation in its algorithm.
+**`build` is not the sole writer of the rows it touches, and its own writes are narrow.** On `Request`, `build` never writes at all — it only reads the `BuildStrategy`/`BaseURI`/`URI` fields `process` set at admit, and it leaves `Request.State` untouched at `processing` throughout (`process`, `buildsignal`, and the DLQ reconciler are `Request.State`'s only writers). On `Build`, `build` is the sole creator — it calls `BuildStore.Create` exactly once for the build it adopts, at step 7 (a redelivery that finds the step-3 reuse gate skips it; the only repeat is the residual pre-durability crash window below) — and never mutates the row again; `buildsignal` is the sole writer of `Build.Status`/`Build.Version` afterward (see [buildsignal.md](buildsignal.md#input-and-re-entrancy)). This division is why `build` never needs a CAS/version write of its own: `Create` is the only storage mutation in its algorithm.
 
 `build` is phase-agnostic: it never asks "which phase is this?" It reads whatever scope is already persisted and immutable on the `Request` and acts on it. Phase 2's project-scoped invocation is expected to read project-scoped equivalents of the scope fields off the same `Request`; the exact shape of a project-scoped trigger is left to the `analyze` design, consistent with `workflow.md`'s "project mapping contract" open question — see [Project-scoped `Trigger`: reserved, not yet designed](#project-scoped-trigger-reserved-not-yet-designed) for the resulting gap in the `BuildRunner` contract itself.
 
-In both phases `build` is strictly the trigger — `buildsignal` owns polling — so a crash between `Trigger` and the publish leaves a build no poller ever picks up; the redelivery triggers a replacement and the orphan is accepted waste, mirroring SubmitQueue (see [Idempotency](#idempotency)).
+In both phases `build` is strictly the trigger — `buildsignal` owns polling. A redelivery that finds the trigger already durable (its Build row and `build_triggered` occurrence) reuses that build and only re-publishes its signal; a crash in the narrow window between `Trigger` returning and those facts becoming durable leaves a build no poller can name, which stays accepted waste (see [Idempotency](#idempotency)).
 
 ## Algorithm
 
@@ -29,44 +29,60 @@ For a delivery carrying request id `R`:
    - a redelivery after the build outcome was already recorded, or after process superseded R,
      must not start a fresh build.
 
-3. Resolve the build-runner for R's Queue: buildRunner = Factory.For(Config{QueueName: R.Queue}).
+3. Reuse a durable trigger: list R's retained request-log occurrences and look for
+   build_triggered; when one names build B, load Build B.
+   - the request log is the request -> build index: the runner mints the build id and
+     BuildStore offers no list-by-request read, so the append-only log (a bounded per-request
+     read the contract already exposes) enumerates the build key instead of a new table.
+   - B exists and B.RequestID == R.ID -> skip steps 4-7, re-publish B's buildsignal with the
+     same stable identity at step 8, and ack. A redelivery after a failed buildsignal publish,
+     a process re-announcement, or a restart never triggers a second build.
+   - the occurrence exists but the Build row misses or names another request -> return raw:
+     the row is created before the occurrence is retained, so this is a storage defect the
+     build DLQ reconciles fail-closed, not a replacement trigger.
+   - no occurrence -> continue to step 4. A List error other than ErrNotFound -> return raw.
+
+4. Resolve the build-runner for R's Queue: buildRunner = Factory.For(Config{QueueName: R.Queue}).
    - lookup failure -> non-retryable (a queue with no builder is a config error).
 
-4. Read the already-decided scope off R: R.BuildStrategy, R.BaseURI, R.URI.
+5. Read the already-decided scope off R: R.BuildStrategy, R.BaseURI, R.URI.
    - build never re-derives incremental-vs-full; process decided it (see process.md).
    - BuildStrategy unset (process's CAS not visible on this reader yet) -> retryable, like step 1.
      Do NOT default to a full build; converge on redelivery once the write lands.
    - baseURI = R.BaseURI if R.BuildStrategy == incremental_since_green, else "" (full build).
    - (headURI = R.URI, baseURI) identify the scope; both are opaque SourceControl tokens.
 
-5. Trigger: buildID, err := buildRunner.Trigger(ctx, baseURI, R.URI, metadata)
+6. Trigger: buildID, err := buildRunner.Trigger(ctx, baseURI, R.URI, metadata)
    - Trigger takes no caller-supplied id; the runner mints the build's identity,
      and buildID becomes Build.ID — SubmitQueue's exact convention (see
      "Alternatives considered" under the contract).
-   - there is deliberately no "already triggered?" pre-check: with a runner-minted
-     id there is no key to check by, so a redelivery re-triggers and downstream
-     idempotency absorbs the duplicate (see Idempotency).
    - Trigger is async: it returns promptly with the runner-assigned id, not an outcome.
    - metadata is empty for now; expected to carry real data eventually (e.g. conflict-graph
      info, or other upstream decisions relevant to the build) once a concrete need lands in
      either domain — the shape is deferred until then, not decided here.
    - failure -> return raw; classifier decides (transient runner blip retryable, bad URI not).
 
-6. Persist Build{ID: buildID.ID, RequestID: R.ID, Status: accepted, Version: 1}
-   via BuildStore.Create.
+7. Persist Build{ID: buildID.ID, RequestID: R.ID, Status: accepted, Version: 1}
+   via BuildStore.Create, then retain the build_triggered occurrence.
    - the row carries no scope; it is recoverable from the Request's immutable fields
      (see the entity table).
-   - a crash between step 5 and this write orphans the triggered build (see Idempotency).
+   - the occurrence is the step-3 reuse gate, retained only after the row creates; persist
+     order stays source write, log write, dependent publish.
+   - a crash between step 6 and the durable row+occurrence orphans the triggered build, and a
+     redelivery that finds no occurrence triggers a replacement: the residual accepted-waste
+     window (see Idempotency).
    - ErrAlreadyExists -> benign (reachable only with a backend that returns deterministic ids
-     for retried triggers); continue to step 7.
+     for retried triggers); continue to step 8.
    - other store error -> return raw; classifier decides.
 
-7. Publish buildID to the buildsignal topic, partitioned by build id.
+8. Publish buildID to the buildsignal topic, partitioned by build id.
    - each build's poll loop then runs in its own partition (see [Partitioning](#partitioning)).
-   - publish failure -> return raw (non-retryable by default); the Build row exists, and the DLQ
-     path owns recovery (see Error classification).
+   - the same stable identity (IntentID(buildID)) is used here and on every step-3 republish,
+     so a redelivery dedups while the queue row survives and re-enqueues if it did not.
+   - publish failure -> return raw (non-retryable by default); the durable Build and occurrence
+     make the next delivery, or the build DLQ, resume at step 3 instead of triggering again.
 
-8. ack.
+9. ack.
 ```
 
 `Build.ID` is **minted by the runner at `Trigger`**, exactly as in SubmitQueue's build controller: the runner returns its native id (a Buildkite build number, a CI-gateway job id), `build` adopts it as the `Build`'s key, and that same id travels on every hop that needs a build — `build` → `buildsignal` carries the build id in the message, so the poll loop reaches the `Build` by a direct get on identity it was handed. `buildsignal` → `record` carries the **request id** instead: `record`'s unit of work is a Request, and the build's terminal status and id are projected onto that Request before the publish, so `record` never reaches a `Build` at all. No reader derives a build id from a Request; the persisted terminal build id supplies the Request → Build navigation, while `Build.RequestID` supplies the other direction. Another approach is deriving the key from the Request (`buildKey(R)`) and/or passing a caller-supplied idempotency key to `Trigger`; see [Alternatives considered](#alternatives-considered-for-the-build-identity) for what each would buy and cost.
@@ -75,13 +91,14 @@ For a delivery carrying request id `R`:
 
 ## Idempotency
 
-Every branch is safe under at-least-once redelivery — with SubmitQueue's posture on duplicates adopted wholesale: `build` has no pre-trigger dedup check (there is no caller-derivable key to check by; see [Alternatives considered](#alternatives-considered-for-the-build-identity)), so a redelivery that reaches step 5 starts a second, independent build, and safety comes from downstream idempotency rather than from preventing the duplicate:
+Every branch is safe under at-least-once redelivery. The durable trigger facts gate re-execution: before calling `Trigger`, `build` reads the request's retained occurrences and, when `build_triggered` already names a build, resumes that build instead of starting a second one. The runner mints the build id, so the request log — not the Build store and not a caller-derived build key — is the index that makes this lookup possible (see [Alternatives considered](#alternatives-considered-for-the-build-identity)):
 
 - **Request not found** — non-retryable; storage's read-after-write guarantee means a miss here is a storage defect, not a lag condition to retry through.
 - **Strategy not yet visible** — retryable; the producing stage's write is not visible on this reader yet.
 - **Request already terminal** (step 2) — ack, no build. A redelivery after `record` finished, or after `process` superseded the head, never starts a stale build.
-- **Redelivery while the Request is still in flight** (crash or failure anywhere in steps 5–8) — the redelivery re-runs from step 1, `Trigger` mints a fresh id, `Create` persists a second `Build` row, and a second poll loop starts. Harmless, in three layers: both builds target the identical `(headURI, baseURI)` scope; each `Build` polls in its own partition and `buildsignal` short-circuits the moment the Request goes terminal (its step 3); and `buildsignal`'s outcome write is first-writer-wins, so the second verdict cannot flip the Request's state or overwrite the create-only validation fact. A build triggered but never persisted (crash between steps 5 and 6) is the same story minus the row: an orphan the runner finishes and nobody ever reads. Wasted CI compute, not a correctness risk — the same accepted trade as SubmitQueue.
-- **Trigger / publish / other store failure** — nothing durable is left half-written that a redelivery can't reconcile; the error rejects to `build_dlq`, and `dlq.NewDLQBuildController` drives a still-`processing` Request to `failed` and releases its Queue slot (see [Fail-closed interaction](#fail-closed-interaction)).
+- **Redelivery with a durable trigger** (a buildsignal publish failure, a restart, or `process` re-announcing after the queue GC'd its dedup row) — step 3 finds the `build_triggered` occurrence, loads that Build, and re-publishes its buildsignal with the same `IntentID(buildID)`; `Trigger` is not called and no second Build row exists. Downstream idempotency remains the second line of defense for any duplicate that raced in before the gate facts were durable.
+- **Crash or failure before the trigger is durable** (steps 6–7) — `Trigger` returned but the Build row and its occurrence are not both durable, so a redelivery finds no gate fact and triggers a replacement; the first, unnamable build is an orphan the runner finishes and nobody reads. That is the only residual duplicate-build window: wasted CI compute, not a correctness risk, and it cannot be closed without an idempotency key the runner backends do not offer (see Alternative B).
+- **Trigger / publish / other store failure** — the error rejects to `build_dlq`. The DLQ reconciler first tries to resume from durable facts (re-publishing buildsignal when the trigger completed); only when no durable trigger exists, or the facts contradict, does it drive a still-`processing` Request to `failed` and release its Queue slot (see [Fail-closed interaction](#fail-closed-interaction)).
 
 ## Edge cases
 
@@ -90,9 +107,9 @@ Every branch is safe under at-least-once redelivery — with SubmitQueue's postu
 
 ## Fail-closed interaction
 
-A build that never reaches step 8 — `Trigger` failing repeatedly, the publish to `buildsignal` never landing, `BuildStore.Create` down — must not wedge its `Request`'s Queue slot forever: `process`'s per-Queue concurrency gate holds `in_flight_count` open until the Request reaches a terminal state (see [process.md](process.md#concurrency-lifecycle)). `build` does not implement the forcing function itself. Per [workflow.md](../workflow.md#fail-closed-on-unprocessable-work), every non-retryable failure in the algorithm rejects to DLQ (see [Error classification](#error-classification)), and a Request stuck past `MaxAttempts` is driven to a conservative terminal `failed` by the DLQ reconciler, which decrements `in_flight_count` and frees the slot. This is the same posture `buildsignal` relies on for its own poll loop (see [buildsignal.md](buildsignal.md#fail-closed-interaction)) — `build` and `buildsignal` are two links in the same fail-closed chain that keeps one bad Request from wedging its Queue.
+A build that never reaches step 8 — `Trigger` failing repeatedly, the publish to `buildsignal` never landing, `BuildStore.Create` down — must not wedge its `Request`'s Queue slot forever: `process`'s per-Queue concurrency gate holds `in_flight_count` open until the Request reaches a terminal state (see [process.md](process.md#concurrency-lifecycle)). `build` does not implement the forcing function itself. Per [workflow.md](../workflow.md#fail-closed-on-unprocessable-work), every non-retryable failure in the algorithm rejects to DLQ (see [Error classification](#error-classification)). The DLQ reconciler first continues the stage from its durable facts: when the trigger already completed (a `build_triggered` occurrence and its Build row both present), it re-publishes that build's signal so polling resumes, leaving the Request and its slot untouched. Only when the trigger never became durable, or the retained facts contradict each other, does it drive a stuck non-terminal Request to the conservative terminal `failed` and decrement `in_flight_count` to free the slot. This is the same posture `buildsignal` relies on for its own poll loop (see [buildsignal.md](buildsignal.md#fail-closed-interaction)) — `build` and `buildsignal` are two links in the same fail-closed chain that keeps one bad Request from wedging its Queue.
 
-`service/stovepipe/server` registers `dlq.NewDLQBuildController` on `build_dlq`. The reconciler loads the request named by the dead-lettered `BuildRequest`, writes a non-terminal request to `failed`, and releases the Queue slot when that request is still `processing`. A request that is already terminal is left alone, except a request already `failed`, whose missing failure log is repaired. A poll `build` already published keeps running on its own delivery: `buildsignal` still releases the slot when that build goes terminal, and this reconciler does not overwrite that outcome.
+`service/stovepipe/server` registers `dlq.NewDLQBuildController` on `build_dlq`. The reconciler loads the request named by the dead-lettered `BuildRequest` and resumes a durably triggered build onto `buildsignal`; otherwise it writes a non-terminal request to `failed` and releases the Queue slot when that request is still `processing`. A request that is already terminal is left alone, except a request already `failed`, whose missing failure log is repaired. A resumed signal keeps the build running on its own poll loop: `buildsignal` releases the slot when that build goes terminal, and this reconciler does not overwrite that outcome.
 
 One boundary is worth stating explicitly: this path fires only when `build` (or a downstream stage) *errors*. A `Trigger` call that returns successfully but the backend never actually runs — or a `Build` row created for a build the runner silently drops — has no protocol-level failure to escalate at the `build` stage; nothing here retries or dead-letters, because nothing failed. That gap surfaces one hop later, when `buildsignal` polls: either the runner reports an error (handled by `buildsignal`'s own classification) or it reports a non-terminal status forever, which is `buildsignal`'s fail-closed boundary to close, not `build`'s (see [buildsignal.md](buildsignal.md#fail-closed-interaction)). `build`'s liveness responsibility ends at a successful publish to `buildsignal`.
 
@@ -282,6 +299,8 @@ Orthogonal to how the `Build` is keyed: give `Trigger` an extra parameter — a 
 | The standard remote-create pattern for at-least-once callers (idempotency keys), so future backends plausibly support it | Diverges `Trigger`'s signature from SubmitQueue's on a parameter neither domain's current backend can act on |
 
 Trade-offs: a parameter no backend can act on is speculative surface, not a working guarantee — and the failure it would prevent is already accounted for as accepted waste.
+
+Neither alternative was adopted; the live design closes the same window a third way. The retained `build_triggered` occurrence already carries the runner-minted build id, and the request log's bounded per-request `List` is the request enumerating its children — the key/value rule's preferred shape — so step 3 reads that index, gets the `Build` by direct key, and re-announces it. It costs neither a second id nor a speculative parameter; the trade is the residual window below Alternative B's: a trigger is reusable only once the occurrence is durable (after the Build row creates), so the crash window between `Trigger` and the row+event still orphans one unnamable build. A caller-derived key or runner token would additionally close that pre-durability window, and remains justifiable only if that narrower waste shows up in practice.
 
 Either could be adopted independently: the idempotency token, if a backend that honors one lands (a purely additive `Trigger` parameter); the derived key, if a stage lands that genuinely must derive a build's key from a Request (moving the runner's id to a distinct `RunnerBuildID` field and wire type, since the two ids would then coexist and must not be confusable). The metric that would justify either is the same: duplicate-build waste showing up in practice.
 

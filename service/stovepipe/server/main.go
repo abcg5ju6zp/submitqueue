@@ -250,7 +250,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	dlqCount, err := registerDLQControllers(dlqConsumer, logger.Sugar(), scope, storageFty, materializer)
+	dlqCount, err := registerDLQControllers(dlqConsumer, logger.Sugar(), scope, storageFty, materializer, registry)
 	if err != nil {
 		return err
 	}
@@ -418,6 +418,7 @@ func registerDLQControllers(
 	scope tally.Scope,
 	store storage.Factory,
 	materializer requestlog.Materializer,
+	registry consumer.TopicRegistry,
 ) (int, error) {
 	var count int
 
@@ -427,7 +428,7 @@ func registerDLQControllers(
 	}
 	count++
 
-	buildDLQController := dlq.NewDLQBuildController(logger, scope, store, materializer, dlq.TopicKey(stovepipemq.TopicKeyBuild), "stovepipe-build-dlq")
+	buildDLQController := dlq.NewDLQBuildController(logger, scope, store, materializer, registry, dlq.TopicKey(stovepipemq.TopicKeyBuild), "stovepipe-build-dlq")
 	if err := c.Register(buildDLQController); err != nil {
 		return count, fmt.Errorf("failed to register build dlq controller: %w", err)
 	}

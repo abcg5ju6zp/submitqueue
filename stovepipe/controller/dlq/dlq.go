@@ -24,8 +24,11 @@
 //
 // Reconciliation strategy. Each DLQ topic carries the same payload as its originating
 // topic (the queue framework preserves the bytes verbatim under a new `{topic}_dlq`
-// name). The DLQ controller decodes that payload to recover the affected request, then
-// transitions it to RequestStateFailed — the conservative unsuccessful outcome, which
+// name). The DLQ controller decodes that payload and continues the stage from its durable
+// facts where possible: the build reconciler first re-announces a build whose trigger is
+// already recorded, so the poll loop resumes instead of failing work that only lost its
+// handoff. When no durable facts let the stage continue, it transitions the affected
+// request to RequestStateFailed — the conservative unsuccessful outcome, which
 // whatever records greenness treats as not-green for gating (see entity.RequestState) —
 // with an idempotent optimistic-locking write so
 // concurrent activity (a late successful pipeline transition) wins cleanly. If the request had

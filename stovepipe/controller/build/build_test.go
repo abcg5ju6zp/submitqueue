@@ -57,6 +57,7 @@ func queueContext() context.Context {
 type buildMocks struct {
 	reqStore      *storagemock.MockRequestStore
 	buildStore    *storagemock.MockBuildStore
+	logStore      *storagemock.MockRequestLogStore
 	store         *storagemock.MockStorage
 	materializer  *requestlogmock.MockMaterializer
 	runnerFactory *buildrunnermock.MockFactory
@@ -78,6 +79,7 @@ func newController(t *testing.T, ctrl *gomock.Controller) (*Controller, buildMoc
 	m := buildMocks{
 		reqStore:      storagemock.NewMockRequestStore(ctrl),
 		buildStore:    storagemock.NewMockBuildStore(ctrl),
+		logStore:      storagemock.NewMockRequestLogStore(ctrl),
 		store:         storagemock.NewMockStorage(ctrl),
 		materializer:  requestlogmock.NewMockMaterializer(ctrl),
 		runnerFactory: buildrunnermock.NewMockFactory(ctrl),
@@ -88,6 +90,7 @@ func newController(t *testing.T, ctrl *gomock.Controller) (*Controller, buildMoc
 
 	m.store.EXPECT().GetRequestStore().Return(m.reqStore).AnyTimes()
 	m.store.EXPECT().GetBuildStore().Return(m.buildStore).AnyTimes()
+	m.store.EXPECT().GetRequestLogStore().Return(m.logStore).AnyTimes()
 
 	queue := mqmock.NewMockQueue(ctrl)
 	queue.EXPECT().Publisher().Return(m.publisher).AnyTimes()
@@ -115,11 +118,39 @@ func expectBuildTriggered(m buildMocks) *gomock.Call {
 	).Return(nil)
 }
 
+// expectNoDurableBuild wires the reuse gate to find no retained trigger occurrence, so the
+// delivery proceeds to a fresh Trigger.
+func expectNoDurableBuild(m buildMocks) {
+	m.logStore.EXPECT().List(gomock.Any(), testID).Return(nil, storage.ErrNotFound)
+}
+
+// expectDurableBuild wires one retained trigger occurrence naming testBuildID.
+func expectDurableBuild(m buildMocks) {
+	logs := []entity.RequestLog{requestlog.NewRequestEventLog(
+		entity.Request{ID: testID, Queue: testQueue},
+		entity.RequestEventBuildTriggered,
+		testBuildID,
+		map[string]string{requestlog.MetadataKeyBuildID: testBuildID},
+	)}
+	m.logStore.EXPECT().List(gomock.Any(), testID).Return(logs, nil)
+}
+
+// triggeredBuildRow returns the Build row persisted for testBuildID.
+func triggeredBuildRow() entity.Build {
+	return entity.Build{
+		ID:        testBuildID,
+		RequestID: testID,
+		Status:    entity.BuildStatusAccepted,
+		Version:   1,
+	}
+}
+
 func TestProcessTagsMetricsWithQueue(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	c, m := newController(t, ctrl)
 	m.reqStore.EXPECT().Get(gomock.Any(), testID).
 		Return(processingRequest(entity.BuildStrategyUnknown, ""), nil)
+	expectNoDurableBuild(m)
 	m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 
 	require.Error(t, c.Process(queueContext(), delivery(t, ctrl, buildPayload(t, testID))))
@@ -168,6 +199,36 @@ func TestPublishBuildSignalCarriesQueueMetadata(t *testing.T) {
 	assert.Equal(t, testQueue, got.Metadata[entityqueue.MetadataKeyQueueName])
 }
 
+func TestProcessReusesDurableTriggeredBuild(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	c, m := newController(t, ctrl)
+
+	m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(processingRequest(entity.BuildStrategyFull, ""), nil)
+	expectDurableBuild(m)
+	m.buildStore.EXPECT().Get(gomock.Any(), testBuildID).Return(triggeredBuildRow(), nil)
+
+	var got entityqueue.Message
+	m.publisher.EXPECT().Publish(gomock.Any(), "buildsignal", gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, msg entityqueue.Message) error {
+			got = msg
+			return nil
+		})
+
+	require.NoError(t, c.Process(queueContext(), delivery(t, ctrl, buildPayload(t, testID))))
+	assert.Equal(t, testBuildID, got.ID, "reused signal keeps the build's stable message identity")
+	assert.Equal(t, testBuildID, got.PartitionKey)
+	assert.Equal(t, testQueue, got.Tenant)
+	assert.Equal(t, testQueue, got.Metadata[entityqueue.MetadataKeyQueueName])
+	sig := &stovepipemq.BuildSignal{}
+	require.NoError(t, stovepipemq.Unmarshal(got.Payload, sig))
+	assert.Equal(t, testBuildID, sig.GetId())
+	assert.Equal(t, testQueue, sig.GetQueueName())
+
+	counter, ok := m.metricsScope.Snapshot().Counters()["test.build_controller.build.trigger_reused+queue=monorepo/main"]
+	require.True(t, ok)
+	assert.EqualValues(t, 1, counter.Value())
+}
+
 func delivery(t *testing.T, ctrl *gomock.Controller, payload []byte) consumer.Delivery {
 	t.Helper()
 	d := consumermock.NewMockDelivery(ctrl)
@@ -212,6 +273,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyIncrementalSinceGreen, testBaseURI)
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), testBaseURI, testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				build := entity.Build{
@@ -230,6 +292,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, testBaseURI)
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				build := entity.Build{
@@ -282,6 +345,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyUnknown, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 			},
 		},
@@ -308,6 +372,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(nil, errors.New("no runner"))
 			},
 		},
@@ -318,6 +383,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{}, errors.New("runner down"))
 			},
@@ -328,6 +394,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				m.buildStore.EXPECT().Create(gomock.Any(), gomock.Any()).Return(storage.ErrAlreadyExists)
@@ -340,6 +407,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				m.buildStore.EXPECT().Create(gomock.Any(), gomock.Any()).Return(errors.New("db down"))
@@ -351,6 +419,7 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				createCall := m.buildStore.EXPECT().Create(gomock.Any(), gomock.Any()).Return(nil)
@@ -374,11 +443,52 @@ func TestProcess(t *testing.T) {
 			setup: func(m buildMocks) {
 				req := processingRequest(entity.BuildStrategyFull, "")
 				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(req, nil)
+				expectNoDurableBuild(m)
 				m.runnerFactory.EXPECT().For(buildrunner.Config{QueueName: testQueue}).Return(m.runner, nil)
 				m.runner.EXPECT().Trigger(gomock.Any(), "", testHeadURI, entity.BuildMetadata(nil)).Return(entity.BuildID{ID: testBuildID}, nil)
 				createCall := m.buildStore.EXPECT().Create(gomock.Any(), gomock.Any()).Return(nil)
 				logCall := expectBuildTriggered(m).After(createCall)
 				m.publisher.EXPECT().Publish(gomock.Any(), "buildsignal", gomock.Any()).Return(errors.New("queue down")).After(logCall)
+			},
+		},
+		{
+			name:      "durable trigger with missing build row errors without re-triggering",
+			wantErr:   true,
+			wantRetry: false,
+			setup: func(m buildMocks) {
+				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(processingRequest(entity.BuildStrategyFull, ""), nil)
+				expectDurableBuild(m)
+				m.buildStore.EXPECT().Get(gomock.Any(), testBuildID).Return(entity.Build{}, storage.ErrNotFound)
+			},
+		},
+		{
+			name:      "durable trigger owned by another request errors without re-triggering",
+			wantErr:   true,
+			wantRetry: false,
+			setup: func(m buildMocks) {
+				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(processingRequest(entity.BuildStrategyFull, ""), nil)
+				expectDurableBuild(m)
+				m.buildStore.EXPECT().Get(gomock.Any(), testBuildID).Return(entity.Build{ID: testBuildID, RequestID: "9"}, nil)
+			},
+		},
+		{
+			name:      "reuse republish failure is not retryable",
+			wantErr:   true,
+			wantRetry: false,
+			setup: func(m buildMocks) {
+				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(processingRequest(entity.BuildStrategyFull, ""), nil)
+				expectDurableBuild(m)
+				m.buildStore.EXPECT().Get(gomock.Any(), testBuildID).Return(triggeredBuildRow(), nil)
+				m.publisher.EXPECT().Publish(gomock.Any(), "buildsignal", gomock.Any()).Return(errors.New("queue down"))
+			},
+		},
+		{
+			name:      "request log storage error is not retryable",
+			wantErr:   true,
+			wantRetry: false,
+			setup: func(m buildMocks) {
+				m.reqStore.EXPECT().Get(gomock.Any(), testID).Return(processingRequest(entity.BuildStrategyFull, ""), nil)
+				m.logStore.EXPECT().List(gomock.Any(), testID).Return(nil, errors.New("db down"))
 			},
 		},
 		{

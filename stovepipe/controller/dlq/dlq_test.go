@@ -25,6 +25,7 @@ import (
 	entityqueue "github.com/uber/submitqueue/platform/base/messagequeue"
 	"github.com/uber/submitqueue/platform/consumer"
 	consumermock "github.com/uber/submitqueue/platform/consumer/mock"
+	mqmock "github.com/uber/submitqueue/platform/extension/messagequeue/mock"
 	"github.com/uber/submitqueue/platform/metrics"
 	stovepipemq "github.com/uber/submitqueue/stovepipe/core/messagequeue"
 	"github.com/uber/submitqueue/stovepipe/core/requestlog"
@@ -49,8 +50,11 @@ func queueContext() context.Context {
 type dlqMocks struct {
 	reqStore     *storagemock.MockRequestStore
 	queueStore   *storagemock.MockQueueStore
+	logStore     *storagemock.MockRequestLogStore
+	buildStore   *storagemock.MockBuildStore
 	store        *storagemock.MockStorage
 	materializer *requestlogmock.MockMaterializer
+	publisher    *mqmock.MockPublisher
 	metricsScope tally.TestScope
 }
 
@@ -67,6 +71,8 @@ func newController(t *testing.T, ctrl *gomock.Controller) (consumer.Controller, 
 	m := dlqMocks{
 		reqStore:     storagemock.NewMockRequestStore(ctrl),
 		queueStore:   storagemock.NewMockQueueStore(ctrl),
+		logStore:     storagemock.NewMockRequestLogStore(ctrl),
+		buildStore:   storagemock.NewMockBuildStore(ctrl),
 		store:        storagemock.NewMockStorage(ctrl),
 		materializer: requestlogmock.NewMockMaterializer(ctrl),
 		metricsScope: scope,
@@ -74,6 +80,8 @@ func newController(t *testing.T, ctrl *gomock.Controller) (consumer.Controller, 
 
 	m.store.EXPECT().GetRequestStore().Return(m.reqStore).AnyTimes()
 	m.store.EXPECT().GetQueueStore().Return(m.queueStore).AnyTimes()
+	m.store.EXPECT().GetRequestLogStore().Return(m.logStore).AnyTimes()
+	m.store.EXPECT().GetBuildStore().Return(m.buildStore).AnyTimes()
 
 	c := NewDLQRequestController(zap.NewNop().Sugar(), scope, staticStorageFactory{store: m.store}, m.materializer, TopicKey(stovepipemq.TopicKeyProcess), "stovepipe-process-dlq")
 	return c, m

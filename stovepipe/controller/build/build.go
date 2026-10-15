@@ -15,11 +15,13 @@
 // Package build holds the build-stage queue controller. It consumes BuildRequest
 // messages (a request id), reloads the Request, triggers the build-runner for
 // the scope process already decided, persists a Build row, and publishes the
-// build id to buildsignal.
+// build id to buildsignal. A redelivery that finds the trigger already durable
+// skips the runner and only re-publishes that build's signal.
 package build
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/uber-go/tally"
@@ -121,6 +123,18 @@ func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) er
 		return nil
 	}
 
+	// A redelivery arriving after the build trigger is already durable — a buildsignal
+	// publish that failed, a restart, or process re-announcing after the queue GC'd its
+	// dedup row — resumes that build instead of triggering a second external one.
+	resumed, err := c.resumeDurableBuild(ctx, store, request)
+	if err != nil {
+		metrics.NamedCounter(c.metricsScope, _opName, "trigger_reuse_errors", 1, metrics.TagsFromContext(ctx)...)
+		return err
+	}
+	if resumed {
+		return nil
+	}
+
 	buildRunner, err := c.buildRunners.For(buildrunner.Config{QueueName: request.Queue})
 	if err != nil {
 		// A queue with no registered builder is a config error.
@@ -166,6 +180,49 @@ func (c *Controller) Process(ctx context.Context, delivery consumer.Delivery) er
 		"base_uri", baseURI,
 	)
 	return nil
+}
+
+// resumeDurableBuild re-announces the build the request already durably triggered when its
+// trigger occurrence is retained. It returns true when the delivery is handled; false when no
+// durable trigger exists yet and the caller should run the trigger path exactly once.
+//
+// The request's append-only log, read through the bounded per-request List, is the
+// request -> build index: the runner mints the build id and BuildStore offers no
+// list-by-request read. The Build row is created before the trigger occurrence is retained, so
+// an occurrence whose row misses (or names another request) violates read-after-write consistency
+// and the delivery fails for the build DLQ to reconcile rather than triggering a replacement.
+func (c *Controller) resumeDurableBuild(ctx context.Context, store storage.Storage, request entity.Request) (bool, error) {
+	logs, err := store.GetRequestLogStore().List(ctx, request.ID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to list request log for request %s: %w", request.ID, err)
+	}
+
+	buildID, ok := requestlog.TriggeredBuildID(logs)
+	if !ok {
+		return false, nil
+	}
+
+	build, err := store.GetBuildStore().Get(ctx, buildID)
+	if err != nil {
+		return false, fmt.Errorf("failed to load durably triggered build %s for request %s: %w", buildID, request.ID, err)
+	}
+	if build.RequestID != request.ID {
+		return false, fmt.Errorf("triggered build %s is owned by request %s, not %s", buildID, build.RequestID, request.ID)
+	}
+
+	if err := c.publishBuildSignal(ctx, buildID, request.Queue); err != nil {
+		return false, fmt.Errorf("failed to republish build signal for build %s: %w", buildID, err)
+	}
+	metrics.NamedCounter(c.metricsScope, _opName, "trigger_reused", 1, metrics.TagsFromContext(ctx)...)
+	c.logger.Infow("reused durably triggered build",
+		"request_id", request.ID,
+		"build_id", buildID,
+		"queue", request.Queue,
+	)
+	return true, nil
 }
 
 func (c *Controller) persistBuildTriggeredLog(ctx context.Context, store storage.Storage, request entity.Request, buildID string) error {
